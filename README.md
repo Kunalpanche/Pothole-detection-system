@@ -21,13 +21,25 @@ This project provides a real-time pothole detection dashboard with dual video so
   - Adaptive JPEG quality + frame pacing for phone uplink
 - GPU acceleration when available (`CUDA`) with automatic CPU fallback
 - Start/Stop detection controls from UI
+- Upload playback controls (upload mode):
+  - Non-loop playback (stops at end of file)
+  - Play/Pause
+  - Speed control slider (supports slow review, e.g., 0.5x)
 - Clear mode identification in UI:
   - `Video Upload Mode`
   - `Phone Browser Mode`
   - Active mode badge + disabled irrelevant controls
 - Real-time stats polling (`/detection_stats`) for:
   - Capture FPS, inference FPS, stream FPS, latency
+  - Per-frame detections and cumulative pothole count
   - Detection confidence and pothole dimension estimates
+  - Detections per minute
+- Real-time detection log table (live polling) with:
+  - Video timeline timestamp (HH:MM:SS)
+  - Pothole detected (Yes/No)
+  - Cumulative pothole count
+  - Length/Width/Depth and depth class
+- PDF report export with KPIs and tabular detection data
 - Estimated pothole metrics:
   - Width (cm)
   - Area (m2)
@@ -73,11 +85,14 @@ Notes:
 - `POST /set_stream_source`: `{ "stream_url": "rtsp://..." }`
 - `GET /video`: phone camera capture page
 - `POST /video_frame`: receives JPEG frames from phone page
+- `POST /set_upload_playback`: `{ "paused": bool, "speed": number }`
 - `POST /start_detection`: starts stream and returns stream URL
 - `POST /stop_detection`: stops current session
 - `POST /set_calibration`: `{ "reference_cm": number, "reference_px": number }` or reset with nulls
 - `GET /video_feed`: MJPEG stream
 - `GET /detection_stats`: live detection + estimation stats
+- `GET /detection_log?since_id=0`: incremental detection table rows
+- `GET /download_report`: download detection report PDF
 
 ## Accuracy Notes
 - Without calibration, size/depth values are heuristic estimates based on perspective and texture cues.

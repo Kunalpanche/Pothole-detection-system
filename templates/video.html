@@ -92,6 +92,7 @@
         const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
         let targetIntervalMs = 45;
         let jpegQuality = 0.5;
+        let consecutiveFails = 0;
 
         function setStatus(text) {
             statusEl.textContent = text;
@@ -117,11 +118,15 @@
             }
 
             try {
-                await fetch(`/video_frame?ts=${Date.now()}`, {
+                const response = await fetch(`/video_frame?ts=${Date.now()}`, {
                     method: "POST",
                     headers: { "Content-Type": "image/jpeg" },
                     body: blob
                 });
+
+                if (!response.ok) {
+                    throw new Error(`Server rejected frame (${response.status})`);
+                }
 
                 const rtt = performance.now() - sendStart;
                 targetIntervalMs = Math.max(28, Math.min(95, rtt * 0.62));
@@ -130,9 +135,14 @@
                 } else if (rtt < 90) {
                     jpegQuality = Math.min(0.58, jpegQuality + 0.01);
                 }
+                consecutiveFails = 0;
                 setStatus(`Streaming ${canvas.width}x${canvas.height} @ ~${Math.round(1000 / targetIntervalMs)} fps`);
-            } catch (_e) {
-                setStatus("Upload failed. Check server connection.");
+            } catch (err) {
+                consecutiveFails += 1;
+                if (consecutiveFails >= 10) {
+                    targetIntervalMs = Math.min(140, targetIntervalMs + 20);
+                }
+                setStatus(`Upload failed (${consecutiveFails}). ${err.message}`);
             } finally {
                 inFlight = false;
             }
@@ -162,6 +172,7 @@
                 streaming = true;
                 targetIntervalMs = 45;
                 jpegQuality = 0.5;
+                consecutiveFails = 0;
 
                 if (timer) {
                     clearTimeout(timer);

@@ -1,17 +1,24 @@
 ﻿from __future__ import annotations
 
+import io
 import os
 import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
 import supervision as sv
 import torch
 from flask import Flask, Response, jsonify, render_template, request
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.pdfgen import canvas
 from ultralytics import YOLO
+from ultralytics.nn.modules.block import AAttn
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -28,6 +35,67 @@ MAX_PHONE_WIDTH = int(os.getenv("MAX_PHONE_WIDTH", "720"))
 STREAM_JPEG_QUALITY = int(os.getenv("STREAM_JPEG_QUALITY", "72"))
 TARGET_LATENCY_MS = float(os.getenv("TARGET_LATENCY_MS", "450"))
 ALLOWED_EXTENSIONS = {"mp4", "avi", "mov", "mkv"}
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "512"))
+
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+
+def _patch_aattn_compat() -> None:
+    # Some checkpoints contain legacy AAttn modules with qk/v attributes instead of qkv.
+    # Newer Ultralytics expects qkv, which crashes during inference unless we handle both.
+    if getattr(AAttn, "_compat_patched", False):
+        return
+
+    def compat_forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        N = H * W
+
+        if hasattr(self, "qkv"):
+            qkv = self.qkv(x).flatten(2).transpose(1, 2)
+            if self.area > 1:
+                qkv = qkv.reshape(B * self.area, N // self.area, C * 3)
+                B, N, _ = qkv.shape
+            q, k, v = (
+                qkv.view(B, N, self.num_heads, self.head_dim * 3)
+                .permute(0, 2, 3, 1)
+                .split([self.head_dim, self.head_dim, self.head_dim], dim=2)
+            )
+        else:
+            qk = self.qk(x).flatten(2).transpose(1, 2)
+            v_raw = self.v(x).flatten(2).transpose(1, 2)
+            if self.area > 1:
+                qk = qk.reshape(B * self.area, N // self.area, C * 2)
+                v_raw = v_raw.reshape(B * self.area, N // self.area, C)
+                B, N, _ = qk.shape
+            q, k = (
+                qk.view(B, N, self.num_heads, self.head_dim * 2)
+                .permute(0, 2, 3, 1)
+                .split([self.head_dim, self.head_dim], dim=2)
+            )
+            v = v_raw.view(B, N, self.num_heads, self.head_dim).permute(0, 2, 3, 1)
+
+        attn = (q.transpose(-2, -1) @ k) * (self.head_dim**-0.5)
+        attn = attn.softmax(dim=-1)
+        out = v @ attn.transpose(-2, -1)
+        out = out.permute(0, 3, 1, 2)
+        v_map = v.permute(0, 3, 1, 2)
+
+        if self.area > 1:
+            out = out.reshape(B // self.area, N * self.area, C)
+            v_map = v_map.reshape(B // self.area, N * self.area, C)
+            B, N, _ = out.shape
+
+        out = out.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+        v_map = v_map.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+
+        out = out + self.pe(v_map)
+        return self.proj(out)
+
+    AAttn.forward = compat_forward
+    AAttn._compat_patched = True
+
+
+_patch_aattn_compat()
 
 
 def allowed_file(filename: str) -> bool:
@@ -73,6 +141,9 @@ class DetectionEngine:
         self.source_label = Path(DEFAULT_VIDEO).name
         self.stream_source_url = ""
         self.phone_last_frame_ts = 0.0
+        self.upload_paused = False
+        self.upload_speed = 1.0
+        self.upload_source_fps = 0.0
 
         self.reference_cm: Optional[float] = None
         self.reference_px: Optional[float] = None
@@ -80,6 +151,7 @@ class DetectionEngine:
         self.latest_frame: Optional[np.ndarray] = None
         self.latest_frame_id = 0
         self.latest_capture_ts = 0.0
+        self.latest_timeline_s = 0.0
         self.last_processed_id = -1
 
         self.latest_jpeg = self._make_status_frame("Idle. Select source and press Start.")
@@ -95,10 +167,20 @@ class DetectionEngine:
         self.running = False
         self.status = "idle"
         self.status_message = "Ready"
+        self.last_error = ""
+        self.session_started_ts = time.time()
+        self.session_first_detection_ts: Optional[float] = None
+        self.total_potholes = 0
+        self.detection_log: List[Dict[str, object]] = []
+        self.max_log_rows = 5000
+        self.log_seq = 0
 
         self.stats: Dict[str, object] = {
             "detections": 0,
+            "total_potholes": 0,
+            "detections_per_min": 0.0,
             "avg_confidence": 0.0,
+            "avg_length_cm": 0.0,
             "avg_width_cm": 0.0,
             "avg_area_m2": 0.0,
             "avg_depth_cm": 0.0,
@@ -115,6 +197,14 @@ class DetectionEngine:
         if current <= 0.0:
             return sample
         return (1.0 - alpha) * current + alpha * sample
+
+    @staticmethod
+    def _format_timeline(seconds: float) -> str:
+        total_seconds = max(0, int(round(seconds)))
+        hh = total_seconds // 3600
+        mm = (total_seconds % 3600) // 60
+        ss = total_seconds % 60
+        return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
     def _make_status_frame(self, text: str) -> bytes:
         frame = np.full((480, 854, 3), 246, dtype=np.uint8)
@@ -171,7 +261,7 @@ class DetectionEngine:
 
         return width_cm, length_cm, area_m2, depth_cm, d_class, estimate_conf
 
-    def _annotate_and_stats(self, frame: np.ndarray) -> np.ndarray:
+    def _annotate_and_stats(self, frame: np.ndarray, timeline_s: float) -> np.ndarray:
         infer_start = time.perf_counter()
 
         proc_frame = frame
@@ -203,25 +293,43 @@ class DetectionEngine:
         confs = detections.confidence if detections.confidence is not None else []
 
         labels: List[str] = []
+        length_values: List[float] = []
         width_values: List[float] = []
         area_values: List[float] = []
         depth_values: List[float] = []
         conf_values: List[float] = []
         estimate_conf_values: List[float] = []
+        log_rows: List[Dict[str, object]] = []
+
+        timeline_display = self._format_timeline(timeline_s)
 
         for idx, xyxy in enumerate(detections.xyxy):
-            width_cm, _length_cm, area_m2, depth_cm, d_class, est_conf = self._estimate_metrics(gray, xyxy, proc_frame.shape)
+            width_cm, length_cm, area_m2, depth_cm, d_class, est_conf = self._estimate_metrics(gray, xyxy, proc_frame.shape)
             conf = float(confs[idx]) if len(confs) > idx else 0.0
 
             labels.append(
-                f"conf {conf:.2f} | w {width_cm:.1f}cm | area {area_m2:.2f}m2 | depth {depth_cm:.1f}cm ({d_class})"
+                f"conf {conf:.2f} | l {length_cm:.1f}cm | w {width_cm:.1f}cm | depth {depth_cm:.1f}cm ({d_class})"
             )
 
+            length_values.append(length_cm)
             width_values.append(width_cm)
             area_values.append(area_m2)
             depth_values.append(depth_cm)
             conf_values.append(conf)
             estimate_conf_values.append(est_conf)
+
+            log_rows.append(
+                {
+                    "video_time": timeline_display,
+                    "video_time_seconds": round(float(timeline_s), 3),
+                    "pothole_detected": "Yes",
+                    "length_cm": round(length_cm, 2),
+                    "width_cm": round(width_cm, 2),
+                    "depth_cm": round(depth_cm, 2),
+                    "depth_class": d_class,
+                    "confidence": round(conf, 3),
+                }
+            )
 
         annotated = self.label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
 
@@ -232,12 +340,36 @@ class DetectionEngine:
         self.infer_fps_ema = self._ema(self.infer_fps_ema, infer_fps, 0.2)
 
         avg_depth = float(np.mean(depth_values)) if depth_values else 0.0
+        avg_length = float(np.mean(length_values)) if length_values else 0.0
+        now_epoch = time.time()
 
         with self.lock:
+            detections_in_frame = int(len(detections))
+            if detections_in_frame > 0:
+                if self.session_first_detection_ts is None:
+                    self.session_first_detection_ts = now_epoch
+                self.total_potholes += detections_in_frame
+
+            if detections_in_frame > 0:
+                for row in log_rows:
+                    self.log_seq += 1
+                    row["id"] = self.log_seq
+                    row["total_count"] = self.total_potholes
+                    self.detection_log.append(row)
+
+            if len(self.detection_log) > self.max_log_rows:
+                self.detection_log = self.detection_log[-self.max_log_rows :]
+
+            elapsed_minutes = max((now_epoch - self.session_started_ts) / 60.0, 1e-6)
+            dpm = self.total_potholes / elapsed_minutes
+
             self.stats.update(
                 {
-                    "detections": int(len(detections)),
+                    "detections": detections_in_frame,
+                    "total_potholes": self.total_potholes,
+                    "detections_per_min": dpm,
                     "avg_confidence": float(np.mean(conf_values)) if conf_values else 0.0,
+                    "avg_length_cm": avg_length,
                     "avg_width_cm": float(np.mean(width_values)) if width_values else 0.0,
                     "avg_area_m2": float(np.mean(area_values)) if area_values else 0.0,
                     "avg_depth_cm": avg_depth,
@@ -250,15 +382,32 @@ class DetectionEngine:
         return annotated
 
     def _open_capture(self, mode: str, source: str) -> Optional[cv2.VideoCapture]:
+        backends: List[int] = []
         if mode == "stream":
-            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            backends.extend([cv2.CAP_FFMPEG, cv2.CAP_ANY])
+            if hasattr(cv2, "CAP_MSMF"):
+                backends.append(int(cv2.CAP_MSMF))
+            if hasattr(cv2, "CAP_DSHOW"):
+                backends.append(int(cv2.CAP_DSHOW))
         else:
-            cap = cv2.VideoCapture(source)
+            backends.extend([cv2.CAP_ANY, cv2.CAP_FFMPEG])
 
-        if cap.isOpened():
+        tried = set()
+        for backend in backends:
+            if backend in tried:
+                continue
+            tried.add(backend)
+            cap = cv2.VideoCapture(source, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            cap.set(cv2.CAP_PROP_FPS, 30)
-        return cap if cap.isOpened() else None
+            if mode != "upload":
+                cap.set(cv2.CAP_PROP_FPS, 30)
+            return cap
+
+        return None
 
     def start(self) -> Tuple[bool, str]:
         self.stop()
@@ -274,9 +423,14 @@ class DetectionEngine:
             if mode == "stream" and not target_source:
                 return False, "No RTSP/IP stream URL configured."
 
+            if mode == "upload" and (not target_source or not Path(target_source).exists()):
+                return False, "Selected upload file was not found. Upload the video again."
+
             cap = self._open_capture(mode, target_source)
             if cap is None:
-                return False, "Could not open selected stream source."
+                if mode == "stream":
+                    return False, "Could not open stream URL. Check URL, credentials, and network connectivity."
+                return False, "Could not open uploaded video file. Verify file integrity and supported format."
 
         with self.lock:
             self.capture = cap
@@ -287,14 +441,26 @@ class DetectionEngine:
                 if mode == "phone"
                 else "Low-latency streaming and inference active"
             )
+            self.last_error = ""
             self.stop_event.clear()
             self.latest_frame = None
             self.latest_frame_id = 0
+            self.latest_timeline_s = 0.0
             self.last_processed_id = -1
             self.prev_capture_ts = 0.0
             self.prev_stream_ts = 0.0
             self.phone_last_frame_ts = 0.0
             self.latest_jpeg_id = 0
+            self.upload_paused = False
+            self.upload_source_fps = 0.0
+            self.session_started_ts = time.time()
+            self.session_first_detection_ts = None
+            self.total_potholes = 0
+            self.log_seq = 0
+            self.detection_log = []
+            self.stats["detections"] = 0
+            self.stats["total_potholes"] = 0
+            self.stats["detections_per_min"] = 0.0
 
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True) if mode in {"upload", "stream"} else None
         self.infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
@@ -325,13 +491,23 @@ class DetectionEngine:
             self.infer_thread = None
 
     def _capture_loop(self) -> None:
+        consecutive_failures = 0
+        last_reconnect_ts = 0.0
+
         while not self.stop_event.is_set():
             with self.lock:
                 cap = self.capture
                 mode = self.mode
+                paused = self.upload_paused
+                speed = self.upload_speed
+                stream_url = self.stream_source_url
 
             if cap is None:
                 break
+
+            if mode == "upload" and paused:
+                time.sleep(0.03)
+                continue
 
             if mode == "stream":
                 # Drain stale frames quickly for live sources so inference always sees the newest frame.
@@ -340,18 +516,51 @@ class DetectionEngine:
 
             ok, frame = cap.read()
             now = time.perf_counter()
+            timeline_s = max(0.0, time.time() - self.session_started_ts)
 
             if not ok:
                 if mode == "upload":
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    with self.lock:
+                        self.running = False
+                        self.status = "stopped"
+                        self.status_message = "Upload playback completed"
+                    break
+
+                if mode == "stream":
+                    consecutive_failures += 1
+                    with self.lock:
+                        self.status = "warning"
+                        self.status_message = "Stream interrupted. Reconnecting..."
+                        self.last_error = "Stream frame read failed"
+
+                    if consecutive_failures >= 10 and (now - last_reconnect_ts) > 1.2:
+                        last_reconnect_ts = now
+                        replacement = self._open_capture("stream", stream_url)
+                        if replacement is not None:
+                            with self.lock:
+                                if self.capture is not None:
+                                    self.capture.release()
+                                self.capture = replacement
+                                self.status = "running"
+                                self.status_message = "Stream reconnected"
+                                self.last_error = ""
+                            consecutive_failures = 0
+                            continue
                 time.sleep(0.01)
                 continue
+
+            consecutive_failures = 0
 
             max_width = self.max_capture_width
             h, w = frame.shape[:2]
             if w > max_width:
                 scale = max_width / float(w)
                 frame = cv2.resize(frame, (max_width, int(h * scale)), interpolation=cv2.INTER_AREA)
+
+            if mode == "upload":
+                pos_msec = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+                if pos_msec > 0:
+                    timeline_s = pos_msec / 1000.0
 
             if self.prev_capture_ts > 0:
                 capture_fps = 1.0 / max(now - self.prev_capture_ts, 1e-6)
@@ -361,8 +570,19 @@ class DetectionEngine:
             with self.lock:
                 self.latest_frame = frame
                 self.latest_capture_ts = now
+                self.latest_timeline_s = timeline_s
                 self.latest_frame_id += 1
                 self.stats["capture_fps"] = self.capture_fps_ema
+
+            if mode == "upload":
+                if self.upload_source_fps <= 0:
+                    fps_candidate = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                    if fps_candidate > 0:
+                        with self.lock:
+                            self.upload_source_fps = fps_candidate
+                target_fps = self.upload_source_fps if self.upload_source_fps > 0 else 24.0
+                paced_fps = max(1.0, target_fps * max(0.1, min(speed, 2.0)))
+                time.sleep(1.0 / paced_fps)
 
     def _infer_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -370,6 +590,7 @@ class DetectionEngine:
                 frame = None if self.latest_frame is None else self.latest_frame.copy()
                 frame_id = self.latest_frame_id
                 capture_ts = self.latest_capture_ts
+                timeline_s = self.latest_timeline_s
                 running = self.running
 
             if not running:
@@ -385,7 +606,15 @@ class DetectionEngine:
                 time.sleep(0.003)
                 continue
 
-            annotated = self._annotate_and_stats(frame)
+            try:
+                annotated = self._annotate_and_stats(frame, timeline_s)
+            except Exception as exc:
+                annotated = frame
+                with self.lock:
+                    self.status = "warning"
+                    self.status_message = "Inference degraded. Streaming raw frames."
+                    self.last_error = f"Inference error: {type(exc).__name__}"
+
             ok, buffer = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
             if not ok:
                 continue
@@ -432,18 +661,70 @@ class DetectionEngine:
                 if idle_for > 2.0:
                     self.status = "warning"
                     self.status_message = "Waiting for phone camera frames from /video"
+                    self.last_error = "No phone camera frames received"
             snapshot = {
                 "running": self.running,
                 "mode": self.mode,
                 "status": self.status,
                 "status_message": self.status_message,
+                "last_error": self.last_error,
                 "source_label": self.source_label,
                 "phone_endpoint": "/video",
                 "device": "GPU (CUDA)" if self.device.startswith("cuda") else "CPU",
                 "calibrated": bool(self.reference_cm and self.reference_px),
+                "upload_paused": self.upload_paused,
+                "upload_speed": self.upload_speed,
             }
             snapshot.update(self.stats)
             return snapshot
+
+    def set_upload_controls(self, paused: Optional[bool], speed: Optional[float]) -> None:
+        with self.lock:
+            if paused is not None:
+                self.upload_paused = bool(paused)
+                if self.mode == "upload" and self.running:
+                    self.status_message = "Upload paused" if self.upload_paused else "Upload playing"
+
+            if speed is not None:
+                self.upload_speed = float(np.clip(speed, 0.1, 2.0))
+
+    def get_log_slice(self, since_id: int = 0, limit: int = 200) -> Dict[str, object]:
+        with self.lock:
+            rows = [row for row in self.detection_log if int(row.get("id", 0)) > since_id]
+            if len(rows) > limit:
+                rows = rows[-limit:]
+            last_id = int(self.detection_log[-1]["id"]) if self.detection_log else 0
+            return {"rows": rows, "last_id": last_id, "total_rows": len(self.detection_log)}
+
+    def build_report_data(self) -> Dict[str, object]:
+        with self.lock:
+            yes_rows = [r for r in self.detection_log if r.get("pothole_detected") == "Yes"]
+            depth_counts = {"shallow": 0, "medium": 0, "severe": 0}
+            for row in yes_rows:
+                d_class = str(row.get("depth_class", "none")).lower()
+                if d_class in depth_counts:
+                    depth_counts[d_class] += 1
+
+            avg_length = float(np.mean([float(r.get("length_cm", 0.0)) for r in yes_rows])) if yes_rows else 0.0
+            avg_width = float(np.mean([float(r.get("width_cm", 0.0)) for r in yes_rows])) if yes_rows else 0.0
+            avg_depth = float(np.mean([float(r.get("depth_cm", 0.0)) for r in yes_rows])) if yes_rows else 0.0
+
+            timestamps = [str(r.get("video_time", "")) for r in yes_rows]
+            first_ts = timestamps[0] if timestamps else "N/A"
+            last_ts = timestamps[-1] if timestamps else "N/A"
+
+            return {
+                "rows": list(self.detection_log),
+                "yes_rows": yes_rows,
+                "total_potholes": self.total_potholes,
+                "avg_length": avg_length,
+                "avg_width": avg_width,
+                "avg_depth": avg_depth,
+                "depth_counts": depth_counts,
+                "first_ts": first_ts,
+                "last_ts": last_ts,
+                "source_label": self.source_label,
+            }
 
     def set_mode(self, mode: str) -> None:
         if mode not in {"upload", "phone", "stream"}:
@@ -460,6 +741,7 @@ class DetectionEngine:
             else:
                 self.source_label = self.stream_source_url or "RTSP/IP Stream"
                 self.status_message = "RTSP/IP stream mode selected"
+            self.last_error = ""
 
     def set_stream_source(self, stream_url: str) -> None:
         with self.lock:
@@ -467,6 +749,7 @@ class DetectionEngine:
             self.mode = "stream"
             self.source_label = stream_url
             self.status_message = "Selected RTSP/IP stream source"
+            self.last_error = ""
 
     def set_upload(self, file_path: str, display_name: str) -> None:
         with self.lock:
@@ -474,6 +757,7 @@ class DetectionEngine:
             self.mode = "upload"
             self.source_label = display_name
             self.status_message = f"Selected file: {display_name}"
+            self.last_error = ""
 
     def push_phone_frame(self, frame: np.ndarray) -> None:
         now = time.perf_counter()
@@ -491,11 +775,13 @@ class DetectionEngine:
             self.phone_last_frame_ts = now
             self.latest_frame = frame
             self.latest_capture_ts = now
+            self.latest_timeline_s = max(0.0, time.time() - self.session_started_ts)
             self.latest_frame_id += 1
             self.stats["capture_fps"] = self.capture_fps_ema
             if self.running and self.mode == "phone":
                 self.status = "running"
                 self.status_message = "Streaming from phone camera"
+                self.last_error = ""
 
     def set_calibration(self, ref_cm: Optional[float], ref_px: Optional[float]) -> None:
         with self.lock:
@@ -527,7 +813,20 @@ def upload_video():
 
     safe_name = secure_filename(file.filename)
     file_path = UPLOAD_DIR / f"{int(time.time())}_{safe_name}"
-    file.save(str(file_path))
+    try:
+        file.save(str(file_path))
+    except OSError:
+        return jsonify({"ok": False, "error": "Unable to save upload. Check disk space and permissions."}), 500
+
+    verifier = cv2.VideoCapture(str(file_path))
+    valid_video = verifier.isOpened()
+    verifier.release()
+    if not valid_video:
+        try:
+            file_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return jsonify({"ok": False, "error": "Uploaded file is not a readable video."}), 400
 
     engine.stop()
     engine.set_upload(str(file_path), safe_name)
@@ -572,7 +871,8 @@ def set_stream_source():
     if not stream_url:
         return jsonify({"ok": False, "error": "Stream URL is required."}), 400
 
-    if not stream_url.startswith(("rtsp://", "http://", "https://")):
+    parsed = urlparse(stream_url)
+    if parsed.scheme not in {"rtsp", "http", "https"} or not parsed.netloc:
         return jsonify({"ok": False, "error": "Use an rtsp:// or http(s):// stream URL."}), 400
 
     engine.stop()
@@ -603,6 +903,153 @@ def set_calibration():
     return jsonify({"ok": True, "message": "Calibration enabled."})
 
 
+@app.route("/set_upload_playback", methods=["POST"])
+def set_upload_playback():
+    payload = request.get_json(silent=True) or {}
+
+    paused_raw = payload.get("paused")
+    speed_raw = payload.get("speed")
+
+    paused: Optional[bool] = None
+    speed: Optional[float] = None
+
+    if paused_raw is not None:
+        paused = bool(paused_raw)
+
+    if speed_raw is not None:
+        try:
+            speed = float(speed_raw)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "Speed must be numeric."}), 400
+
+    engine.set_upload_controls(paused=paused, speed=speed)
+    return jsonify({"ok": True})
+
+
+@app.route("/detection_log")
+def detection_log():
+    since_id_raw = request.args.get("since_id", "0")
+    try:
+        since_id = int(since_id_raw)
+    except ValueError:
+        since_id = 0
+
+    payload = engine.get_log_slice(since_id=since_id, limit=300)
+    return jsonify({"ok": True, **payload})
+
+
+def _draw_report_pdf(report: Dict[str, object]) -> bytes:
+    rows = report["rows"]
+    depth_counts = report["depth_counts"]
+
+    pdf_buffer = io.BytesIO()
+    pdf = canvas.Canvas(pdf_buffer, pagesize=A4)
+    page_w, page_h = A4
+
+    def draw_header(y: float) -> float:
+        pdf.setFillColor(colors.HexColor("#1f2937"))
+        pdf.setFont("Helvetica-Bold", 16)
+        pdf.drawString(2 * cm, y, "Pothole Detection Report")
+        y -= 0.5 * cm
+        pdf.setFont("Helvetica", 10)
+        pdf.setFillColor(colors.HexColor("#4b5563"))
+        pdf.drawString(2 * cm, y, f"Source: {report['source_label']}")
+        return y - 0.6 * cm
+
+    y = draw_header(page_h - 2 * cm)
+
+    pdf.setFont("Helvetica-Bold", 11)
+    pdf.setFillColor(colors.black)
+    pdf.drawString(2 * cm, y, "Key KPIs")
+    y -= 0.45 * cm
+
+    pdf.setFont("Helvetica", 10)
+    pdf.drawString(2 * cm, y, f"Total potholes detected: {report['total_potholes']}")
+    y -= 0.38 * cm
+    pdf.drawString(
+        2 * cm,
+        y,
+        f"Average size (L x W x D): {report['avg_length']:.2f} x {report['avg_width']:.2f} x {report['avg_depth']:.2f} cm",
+    )
+    y -= 0.38 * cm
+    pdf.drawString(
+        2 * cm,
+        y,
+        f"Depth distribution: shallow={depth_counts['shallow']} medium={depth_counts['medium']} severe={depth_counts['severe']}",
+    )
+    y -= 0.38 * cm
+    pdf.drawString(2 * cm, y, f"Detection window: {report['first_ts']} to {report['last_ts']}")
+    y -= 0.7 * cm
+
+    headers = ["Time", "Detected", "Total", "L(cm)", "W(cm)", "D(cm)", "Class"]
+    col_widths = [4.1 * cm, 2.0 * cm, 1.7 * cm, 1.8 * cm, 1.8 * cm, 1.8 * cm, 2.2 * cm]
+
+    def draw_table_header(y_pos: float) -> float:
+        x = 2 * cm
+        pdf.setFillColor(colors.HexColor("#f4b400"))
+        pdf.rect(x, y_pos - 0.35 * cm, sum(col_widths), 0.45 * cm, fill=1, stroke=0)
+        pdf.setFillColor(colors.HexColor("#1f2937"))
+        pdf.setFont("Helvetica-Bold", 9)
+        for idx, head in enumerate(headers):
+            pdf.drawString(x + 0.08 * cm, y_pos - 0.2 * cm, head)
+            x += col_widths[idx]
+        return y_pos - 0.5 * cm
+
+    y = draw_table_header(y)
+
+    pdf.setFont("Helvetica", 8.5)
+    max_rows = min(len(rows), 800)
+    rows_to_render = rows[:max_rows]
+    for idx, row in enumerate(rows_to_render):
+        if y < 1.8 * cm:
+            pdf.showPage()
+            y = draw_header(page_h - 1.5 * cm)
+            y = draw_table_header(y)
+            pdf.setFont("Helvetica", 8.5)
+
+        x = 2 * cm
+        if idx % 2 == 0:
+            pdf.setFillColor(colors.HexColor("#f9fafb"))
+            pdf.rect(x, y - 0.28 * cm, sum(col_widths), 0.36 * cm, fill=1, stroke=0)
+
+        pdf.setFillColor(colors.HexColor("#111827"))
+        values = [
+            str(row.get("video_time", "")),
+            str(row.get("pothole_detected", "")),
+            str(row.get("total_count", "")),
+            f"{float(row.get('length_cm', 0.0)):.1f}",
+            f"{float(row.get('width_cm', 0.0)):.1f}",
+            f"{float(row.get('depth_cm', 0.0)):.1f}",
+            str(row.get("depth_class", "")),
+        ]
+        for col_idx, value in enumerate(values):
+            pdf.drawString(x + 0.08 * cm, y - 0.16 * cm, value)
+            x += col_widths[col_idx]
+
+        y -= 0.36 * cm
+
+    if len(rows) > max_rows:
+        y -= 0.2 * cm
+        pdf.setFont("Helvetica-Oblique", 8.5)
+        pdf.setFillColor(colors.HexColor("#6b7280"))
+        pdf.drawString(2 * cm, y, f"Note: Showing first {max_rows} rows of {len(rows)} total log entries.")
+
+    pdf.save()
+    return pdf_buffer.getvalue()
+
+
+@app.route("/download_report")
+def download_report():
+    report = engine.build_report_data()
+    pdf_bytes = _draw_report_pdf(report)
+    filename = f"pothole_report_{int(time.time())}.pdf"
+    return Response(
+        pdf_bytes,
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
 @app.route("/start_detection", methods=["POST"])
 def start_detection():
     ok, message = engine.start()
@@ -625,6 +1072,16 @@ def video_feed():
 @app.route("/detection_stats")
 def detection_stats():
     return jsonify(engine.get_snapshot())
+
+
+@app.errorhandler(413)
+def request_too_large(_err):
+    return jsonify(
+        {
+            "ok": False,
+            "error": f"Upload exceeds {MAX_UPLOAD_MB} MB limit. Compress the video or increase MAX_UPLOAD_MB.",
+        }
+    ), 413
 
 
 if __name__ == "__main__":

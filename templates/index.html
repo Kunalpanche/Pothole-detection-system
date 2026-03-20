@@ -220,6 +220,74 @@
             gap: 9px;
         }
 
+        .playback-wrap {
+            display: grid;
+            gap: 8px;
+        }
+
+        .speed-row {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 8px;
+            align-items: center;
+        }
+
+        input[type="range"] {
+            width: 100%;
+            accent-color: #d98f00;
+        }
+
+        .log-wrap {
+            margin-top: 16px;
+        }
+
+        .table-shell {
+            border: 1px solid #ebd99a;
+            border-radius: 12px;
+            overflow: hidden;
+            background: #fffef5;
+        }
+
+        .table-scroll {
+            max-height: 320px;
+            overflow: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.84rem;
+        }
+
+        thead th {
+            position: sticky;
+            top: 0;
+            background: #ffe9a0;
+            color: #523a00;
+            border-bottom: 1px solid #e5bf53;
+            padding: 8px;
+            text-align: left;
+            white-space: nowrap;
+        }
+
+        tbody td {
+            border-bottom: 1px solid #f0e4b9;
+            padding: 7px 8px;
+            white-space: nowrap;
+            color: #3d2e07;
+        }
+
+        tbody tr:nth-child(even) { background: #fffbec; }
+
+        tbody tr.new-row {
+            animation: flashRow 1.1s ease;
+        }
+
+        @keyframes flashRow {
+            0% { background: #ffe17a; }
+            100% { background: transparent; }
+        }
+
         .stat {
             border: 1px solid #ecdca5;
             border-radius: 10px;
@@ -271,6 +339,7 @@
                 </div>
                 <div class="feed-wrap"><img id="feed" alt="Detection Stream" /></div>
                 <p class="hint" id="status-message">Select a mode and source, then press Start Detection.</p>
+                <p class="hint" id="feed-error" style="display:none; color: var(--danger);"></p>
             </article>
 
             <aside class="card sidebar">
@@ -304,6 +373,21 @@
                     <div class="row">
                         <button class="btn primary" id="start-btn">Start Detection</button>
                         <button class="btn stop" id="stop-btn">Stop Detection</button>
+                        <button class="btn" id="download-report-btn">Download PDF Report</button>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <h3>Upload Playback</h3>
+                    <div class="playback-wrap">
+                        <div class="row">
+                            <button class="btn" id="play-upload-btn">Play</button>
+                            <button class="btn" id="pause-upload-btn">Pause</button>
+                        </div>
+                        <div class="speed-row">
+                            <input type="range" id="speed-slider" min="0.1" max="1.5" value="0.5" step="0.1" />
+                            <strong id="speed-label">0.5x</strong>
+                        </div>
                     </div>
                 </div>
 
@@ -324,12 +408,15 @@
                     <div class="stats-grid">
                         <div class="stat"><p class="k">Status</p><p class="v" id="st-status">idle</p></div>
                         <div class="stat"><p class="k">Device</p><p class="v" id="st-device">CPU</p></div>
-                        <div class="stat"><p class="k">Detections</p><p class="v" id="st-detections">0</p></div>
+                        <div class="stat"><p class="k">Current Frame</p><p class="v" id="st-detections">0</p></div>
+                        <div class="stat"><p class="k">Total Potholes</p><p class="v" id="st-total">0</p></div>
+                        <div class="stat"><p class="k">Detections / Min</p><p class="v" id="st-dpm">0.0</p></div>
                         <div class="stat"><p class="k">Capture FPS</p><p class="v" id="st-cfps">0.0</p></div>
                         <div class="stat"><p class="k">Inference FPS</p><p class="v" id="st-ifps">0.0</p></div>
                         <div class="stat"><p class="k">Stream FPS</p><p class="v" id="st-sfps">0.0</p></div>
                         <div class="stat"><p class="k">Latency</p><p class="v" id="st-lat">0 ms</p></div>
                         <div class="stat"><p class="k">Avg Confidence</p><p class="v" id="st-conf">0.00</p></div>
+                        <div class="stat"><p class="k">Avg Length</p><p class="v" id="st-length">0.0 cm</p></div>
                         <div class="stat"><p class="k">Avg Width</p><p class="v" id="st-width">0.0 cm</p></div>
                         <div class="stat"><p class="k">Avg Area</p><p class="v" id="st-area">0.00 m2</p></div>
                         <div class="stat"><p class="k">Avg Depth</p><p class="v" id="st-depth">0.0 cm</p></div>
@@ -339,20 +426,87 @@
             </aside>
         </section>
 
+        <section class="card log-wrap">
+            <div style="padding: 12px; border-bottom: 1px solid #ecdca5;"><strong>Live Detection Log</strong></div>
+            <div class="table-shell">
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Video Time</th>
+                                <th>Detected</th>
+                                <th>Total Count</th>
+                                <th>Length (cm)</th>
+                                <th>Width (cm)</th>
+                                <th>Depth (cm)</th>
+                                <th>Depth Class</th>
+                            </tr>
+                        </thead>
+                        <tbody id="log-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
         <p class="footer">Optimized for low-latency pothole analytics with explicit mode awareness and phone/IP stream support.</p>
     </main>
 
     <script>
         const feed = document.getElementById("feed");
+        const feedError = document.getElementById("feed-error");
         let activeMode = "upload";
+        let lastLogId = 0;
+        const MAX_TABLE_ROWS = 600;
+        const MAX_FEED_RETRIES = 3;
+        let feedRetries = 0;
+        let feedRetryTimer = null;
+
+        function showFeedError(message) {
+            feedError.textContent = message;
+            feedError.style.display = "block";
+        }
+
+        function clearFeedError() {
+            feedError.textContent = "";
+            feedError.style.display = "none";
+        }
+
+        function queueFeedRetry() {
+            if (feedRetries >= MAX_FEED_RETRIES) {
+                showFeedError("Video feed failed to load. Check source and press Start Detection again.");
+                return;
+            }
+
+            if (feedRetryTimer) {
+                clearTimeout(feedRetryTimer);
+            }
+
+            const nextRetry = ++feedRetries;
+            showFeedError(`Video feed interrupted. Retrying (${nextRetry}/${MAX_FEED_RETRIES})...`);
+            feedRetryTimer = setTimeout(() => {
+                const src = feed.getAttribute("data-stream-url");
+                if (src) {
+                    feed.src = `${src}?t=${Date.now()}`;
+                }
+            }, 650);
+        }
 
         async function postJSON(url, payload = {}) {
-            const response = await fetch(url, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload)
-            });
-            return response.json();
+            try {
+                const response = await fetch(url, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload)
+                });
+
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    return { ok: false, error: data.error || `Request failed (${response.status})` };
+                }
+                return data;
+            } catch (_e) {
+                return { ok: false, error: "Server unreachable. Check network/server status." };
+            }
         }
 
         function updateModeUI() {
@@ -394,8 +548,18 @@
             const formData = new FormData();
             formData.append("video", fileInput.files[0]);
 
-            const response = await fetch("/upload_video", { method: "POST", body: formData });
-            const data = await response.json();
+            let data = {};
+            try {
+                const response = await fetch("/upload_video", { method: "POST", body: formData });
+                data = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    alert(data.error || `Upload failed (${response.status}).`);
+                    return;
+                }
+            } catch (_e) {
+                alert("Upload failed. Check server connection.");
+                return;
+            }
 
             if (!data.ok) {
                 alert(data.error || "Upload failed.");
@@ -413,7 +577,10 @@
                 alert(data.error || "Unable to start detection.");
                 return;
             }
-            feed.src = `${data.video_url}?t=${Date.now()}`;
+            clearFeedError();
+            feedRetries = 0;
+            feed.setAttribute("data-stream-url", data.video_url || "/video_feed");
+            feed.src = `${feed.getAttribute("data-stream-url")}?t=${Date.now()}`;
         }
 
         async function setStreamSource() {
@@ -436,6 +603,81 @@
 
         async function stopDetection() {
             await postJSON("/stop_detection");
+            if (feedRetryTimer) {
+                clearTimeout(feedRetryTimer);
+                feedRetryTimer = null;
+            }
+            feed.removeAttribute("data-stream-url");
+            feed.removeAttribute("src");
+            clearFeedError();
+        }
+
+        async function setUploadPlayback(payload) {
+            const data = await postJSON("/set_upload_playback", payload);
+            if (!data.ok) {
+                alert(data.error || "Failed to update playback controls.");
+            }
+        }
+
+        function appendLogRows(rows) {
+            if (!rows || rows.length === 0) {
+                return;
+            }
+
+            const tbody = document.getElementById("log-body");
+            const frag = document.createDocumentFragment();
+
+            rows.forEach((row) => {
+                const tr = document.createElement("tr");
+                tr.classList.add("new-row");
+                tr.innerHTML = `
+                    <td>${row.video_time || ""}</td>
+                    <td>${row.pothole_detected || "No"}</td>
+                    <td>${row.total_count ?? 0}</td>
+                    <td>${Number(row.length_cm || 0).toFixed(1)}</td>
+                    <td>${Number(row.width_cm || 0).toFixed(1)}</td>
+                    <td>${Number(row.depth_cm || 0).toFixed(1)}</td>
+                    <td>${row.depth_class || "none"}</td>
+                `;
+                frag.appendChild(tr);
+            });
+
+            tbody.appendChild(frag);
+
+            while (tbody.rows.length > MAX_TABLE_ROWS) {
+                tbody.deleteRow(0);
+            }
+
+            const scroller = tbody.closest(".table-scroll");
+            if (scroller) {
+                const atBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 50;
+                if (atBottom) {
+                    scroller.scrollTop = scroller.scrollHeight;
+                }
+            }
+        }
+
+        async function updateLog() {
+            try {
+                const response = await fetch(`/detection_log?since_id=${lastLogId}`);
+                const data = await response.json();
+                if (!data.ok) {
+                    return;
+                }
+                appendLogRows(data.rows || []);
+                lastLogId = Number(data.last_id || lastLogId);
+            } catch (_e) {
+                // Ignore transient log polling errors.
+            }
+        }
+
+        function resetLogTable() {
+            document.getElementById("log-body").innerHTML = "";
+            lastLogId = 0;
+        }
+
+        function downloadReport() {
+            window.location.href = `/download_report?t=${Date.now()}`;
         }
 
         async function applyCalibration() {
@@ -472,6 +714,11 @@
 
                 styleStatusPill(s.status || "idle");
                 document.getElementById("status-message").textContent = s.status_message || "";
+                if (s.last_error && (s.status === "warning" || s.status === "stopped")) {
+                    showFeedError(s.last_error);
+                } else if (s.status === "running") {
+                    clearFeedError();
+                }
                 const phoneEndpoint = document.getElementById("phone-endpoint");
                 phoneEndpoint.value = `${window.location.origin}${s.phone_endpoint || "/video"}`;
 
@@ -481,14 +728,22 @@
                 document.getElementById("st-status").textContent = s.status || "idle";
                 document.getElementById("st-device").textContent = s.device || "CPU";
                 document.getElementById("st-detections").textContent = s.detections ?? 0;
+                document.getElementById("st-total").textContent = s.total_potholes ?? 0;
+                document.getElementById("st-dpm").textContent = Number(s.detections_per_min || 0).toFixed(1);
                 document.getElementById("st-cfps").textContent = Number(s.capture_fps || 0).toFixed(1);
                 document.getElementById("st-ifps").textContent = Number(s.infer_fps || 0).toFixed(1);
                 document.getElementById("st-sfps").textContent = Number(s.stream_fps || 0).toFixed(1);
                 document.getElementById("st-lat").textContent = `${Number(s.latency_ms || 0).toFixed(0)} ms`;
                 document.getElementById("st-conf").textContent = Number(s.avg_confidence || 0).toFixed(2);
+                document.getElementById("st-length").textContent = `${Number(s.avg_length_cm || 0).toFixed(1)} cm`;
                 document.getElementById("st-width").textContent = `${Number(s.avg_width_cm || 0).toFixed(1)} cm`;
                 document.getElementById("st-area").textContent = `${Number(s.avg_area_m2 || 0).toFixed(2)} m2`;
                 document.getElementById("st-depth").textContent = `${Number(s.avg_depth_cm || 0).toFixed(1)} cm`;
+
+                const slider = document.getElementById("speed-slider");
+                const speedVal = Number(s.upload_speed || slider.value || 0.5);
+                slider.value = speedVal.toFixed(1);
+                document.getElementById("speed-label").textContent = `${speedVal.toFixed(1)}x`;
 
                 const dClass = document.getElementById("st-dclass");
                 dClass.textContent = s.depth_class || "none";
@@ -503,14 +758,36 @@
         document.getElementById("tab-stream").addEventListener("click", () => switchMode("stream"));
         document.getElementById("upload-btn").addEventListener("click", uploadVideo);
         document.getElementById("set-stream-btn").addEventListener("click", setStreamSource);
-        document.getElementById("start-btn").addEventListener("click", startDetection);
+        document.getElementById("start-btn").addEventListener("click", async () => {
+            resetLogTable();
+            await startDetection();
+        });
         document.getElementById("stop-btn").addEventListener("click", stopDetection);
+        document.getElementById("download-report-btn").addEventListener("click", downloadReport);
         document.getElementById("apply-calib").addEventListener("click", applyCalibration);
         document.getElementById("reset-calib").addEventListener("click", resetCalibration);
+        document.getElementById("play-upload-btn").addEventListener("click", () => setUploadPlayback({ paused: false }));
+        document.getElementById("pause-upload-btn").addEventListener("click", () => setUploadPlayback({ paused: true }));
+        document.getElementById("speed-slider").addEventListener("input", (event) => {
+            const speed = Number(event.target.value || 0.5);
+            document.getElementById("speed-label").textContent = `${speed.toFixed(1)}x`;
+        });
+        document.getElementById("speed-slider").addEventListener("change", (event) => {
+            const speed = Number(event.target.value || 0.5);
+            setUploadPlayback({ speed });
+        });
+
+        feed.addEventListener("load", () => {
+            feedRetries = 0;
+            clearFeedError();
+        });
+        feed.addEventListener("error", queueFeedRetry);
 
         updateModeUI();
         updateStats();
+        updateLog();
         setInterval(updateStats, 700);
+        setInterval(updateLog, 700);
     </script>
 </body>
 </html>
