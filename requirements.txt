@@ -1,0 +1,6 @@
+flask
+opencv-python
+supervision
+ultralytics
+huggingface_hub
+pyresearch

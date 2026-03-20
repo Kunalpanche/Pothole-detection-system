@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Phone Camera Stream</title>
+    <style>
+        body {
+            margin: 0;
+            font-family: "Segoe UI", Arial, sans-serif;
+            background: #fffdf4;
+            color: #1f2937;
+            padding: 16px;
+        }
+
+        .card {
+            max-width: 720px;
+            margin: 0 auto;
+            background: #ffffff;
+            border: 1px solid #f0e0a2;
+            border-radius: 14px;
+            padding: 14px;
+        }
+
+        h1 {
+            margin: 0 0 8px;
+            font-size: 1.2rem;
+        }
+
+        p {
+            margin: 0 0 10px;
+            color: #4b5563;
+            font-size: 0.92rem;
+        }
+
+        video {
+            width: 100%;
+            border-radius: 12px;
+            border: 1px solid #e6c65b;
+            background: #000;
+        }
+
+        .row {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            border: 1px solid #d98f00;
+            background: #f4b400;
+            color: #3b2b00;
+            border-radius: 10px;
+            padding: 9px 12px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        button.secondary {
+            background: #fff4bf;
+            border-color: #e2bd51;
+        }
+
+        #status {
+            margin-top: 10px;
+            font-size: 0.9rem;
+            color: #6b7280;
+        }
+    </style>
+</head>
+<body>
+    <section class="card">
+        <h1>Phone Camera Uplink</h1>
+        <p>Keep this page open while detection runs on the dashboard.</p>
+        <video id="preview" autoplay playsinline muted></video>
+        <div class="row">
+            <button id="start">Start Camera</button>
+            <button id="stop" class="secondary">Stop</button>
+        </div>
+        <div id="status">Idle</div>
+    </section>
+
+    <script>
+        const video = document.getElementById("preview");
+        const statusEl = document.getElementById("status");
+        let mediaStream = null;
+        let timer = null;
+        let inFlight = false;
+        let streaming = false;
+        let canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+        let targetIntervalMs = 45;
+        let jpegQuality = 0.5;
+
+        function setStatus(text) {
+            statusEl.textContent = text;
+        }
+
+        async function sendFrame() {
+            if (!streaming || !mediaStream || video.videoWidth === 0 || video.videoHeight === 0 || inFlight) {
+                return;
+            }
+            inFlight = true;
+            const sendStart = performance.now();
+
+            const targetWidth = 560;
+            const scale = Math.min(1, targetWidth / video.videoWidth);
+            canvas.width = Math.round(video.videoWidth * scale);
+            canvas.height = Math.round(video.videoHeight * scale);
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", jpegQuality));
+            if (!blob) {
+                inFlight = false;
+                return;
+            }
+
+            try {
+                await fetch(`/video_frame?ts=${Date.now()}`, {
+                    method: "POST",
+                    headers: { "Content-Type": "image/jpeg" },
+                    body: blob
+                });
+
+                const rtt = performance.now() - sendStart;
+                targetIntervalMs = Math.max(28, Math.min(95, rtt * 0.62));
+                if (rtt > 170) {
+                    jpegQuality = Math.max(0.38, jpegQuality - 0.03);
+                } else if (rtt < 90) {
+                    jpegQuality = Math.min(0.58, jpegQuality + 0.01);
+                }
+                setStatus(`Streaming ${canvas.width}x${canvas.height} @ ~${Math.round(1000 / targetIntervalMs)} fps`);
+            } catch (_e) {
+                setStatus("Upload failed. Check server connection.");
+            } finally {
+                inFlight = false;
+            }
+        }
+
+        async function streamLoop() {
+            if (!streaming) {
+                return;
+            }
+            await sendFrame();
+            timer = setTimeout(streamLoop, targetIntervalMs);
+        }
+
+        async function startCamera() {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: { ideal: "environment" },
+                        width: { ideal: 640 },
+                        height: { ideal: 360 },
+                        frameRate: { ideal: 20, max: 24 }
+                    },
+                    audio: false
+                });
+                video.srcObject = mediaStream;
+                setStatus("Camera started. Streaming frames...");
+                streaming = true;
+                targetIntervalMs = 45;
+                jpegQuality = 0.5;
+
+                if (timer) {
+                    clearTimeout(timer);
+                }
+                streamLoop();
+            } catch (err) {
+                setStatus(`Camera error: ${err.message}`);
+            }
+        }
+
+        function stopCamera() {
+            streaming = false;
+            if (timer) {
+                clearTimeout(timer);
+                timer = null;
+            }
+            if (mediaStream) {
+                mediaStream.getTracks().forEach((track) => track.stop());
+                mediaStream = null;
+            }
+            video.srcObject = null;
+            setStatus("Stopped.");
+        }
+
+        document.getElementById("start").addEventListener("click", startCamera);
+        document.getElementById("stop").addEventListener("click", stopCamera);
+    </script>
+</body>
+</html>

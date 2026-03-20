@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Real-Time Pothole Detection</title>
+    <style>
+        :root {
+            --bg: #fffdf4;
+            --surface: #ffffff;
+            --surface-soft: #fff8d8;
+            --text: #1f2937;
+            --muted: #6b7280;
+            --accent: #f4b400;
+            --accent-strong: #d98f00;
+            --border: #f0e0a2;
+            --success: #15803d;
+            --warning: #b45309;
+            --danger: #b91c1c;
+            --shadow: 0 10px 28px rgba(159, 119, 0, 0.14);
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            font-family: "Segoe UI", "Trebuchet MS", sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at top right, #ffeeb0 0%, #fffdf4 38%),
+                linear-gradient(180deg, #fffef8, #fffdf4);
+        }
+
+        .page {
+            max-width: 1320px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .hero {
+            background: linear-gradient(118deg, #ffe17a, #ffd44f 46%, #ffca2c);
+            border: 1px solid #efbf30;
+            border-radius: 20px;
+            box-shadow: var(--shadow);
+            padding: 22px;
+        }
+
+        .hero-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .hero h1 {
+            margin: 0;
+            font-size: clamp(1.35rem, 2vw, 2.05rem);
+        }
+
+        .hero p {
+            margin: 8px 0 0;
+            color: #4b5563;
+            font-size: 0.95rem;
+        }
+
+        .mode-badge {
+            background: #fff8db;
+            border: 1px solid #e4bf48;
+            color: #5f4304;
+            border-radius: 999px;
+            padding: 7px 12px;
+            font-weight: 700;
+            font-size: 0.85rem;
+        }
+
+        .layout {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 18px;
+            margin-top: 18px;
+        }
+
+        .card {
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            background: var(--surface);
+            box-shadow: var(--shadow);
+        }
+
+        .viewer {
+            padding: 14px;
+        }
+
+        .viewer-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .status-pill {
+            border-radius: 999px;
+            padding: 6px 11px;
+            font-size: 0.82rem;
+            border: 1px solid #dfcc85;
+            background: #fff7cf;
+            font-weight: 700;
+            color: #6e4d00;
+        }
+
+        .status-pill.running { color: #065f46; border-color: #7ad5b2; background: #ebfff6; }
+        .status-pill.warning { color: #7c2d12; border-color: #f5bf86; background: #fff1e4; }
+        .status-pill.stopped, .status-pill.idle { color: #7c2d12; border-color: #f3cb92; background: #fff7e8; }
+
+        .feed-wrap {
+            border: 1px dashed #e4c55f;
+            border-radius: 12px;
+            min-height: 340px;
+            background: #fff9df;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .feed-wrap img {
+            width: 100%;
+            max-height: 72vh;
+            object-fit: contain;
+            display: block;
+        }
+
+        .hint {
+            margin: 10px 3px 0;
+            color: var(--muted);
+            font-size: 0.9rem;
+        }
+
+        .sidebar {
+            padding: 14px;
+            display: grid;
+            gap: 12px;
+            align-content: start;
+        }
+
+        .section {
+            border: 1px solid var(--border);
+            background: var(--surface-soft);
+            border-radius: 12px;
+            padding: 12px;
+        }
+
+        .section h3 {
+            margin: 0 0 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            font-size: 0.9rem;
+            color: #6a4b00;
+        }
+
+        .mode-tabs {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 8px;
+        }
+
+        .tab {
+            border: 1px solid #e2bd51;
+            border-radius: 10px;
+            background: #fff4bf;
+            color: #543c00;
+            padding: 9px 8px;
+            font-weight: 700;
+            cursor: pointer;
+            text-align: center;
+        }
+
+        .tab.active {
+            background: var(--accent);
+            border-color: var(--accent-strong);
+        }
+
+        .row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+        .btn {
+            border: 1px solid #dfbc56;
+            border-radius: 10px;
+            background: #fff4bf;
+            color: #513900;
+            padding: 9px 12px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        .btn.primary { background: var(--accent); border-color: var(--accent-strong); }
+        .btn.stop { background: #ffe1cc; border-color: #ecb98d; color: #7c2d12; }
+
+        .btn:disabled, input:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
+
+        input[type="file"],
+        input[type="text"],
+        input[type="number"] {
+            width: 100%;
+            border: 1px solid #e2d4a3;
+            border-radius: 9px;
+            background: #fff;
+            color: var(--text);
+            padding: 8px 10px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 9px;
+        }
+
+        .stat {
+            border: 1px solid #ecdca5;
+            border-radius: 10px;
+            background: #fff;
+            padding: 9px;
+        }
+
+        .k { margin: 0; color: var(--muted); font-size: 0.78rem; }
+        .v { margin: 4px 0 0; font-size: 1rem; font-weight: 800; color: #46320a; }
+
+        .v.severe { color: var(--danger); }
+
+        .footer {
+            text-align: center;
+            margin-top: 14px;
+            color: #6b7280;
+            font-size: 0.86rem;
+        }
+
+        @media (max-width: 1020px) {
+            .layout { grid-template-columns: 1fr; }
+            .stats-grid { grid-template-columns: 1fr 1fr; }
+        }
+
+        @media (max-width: 560px) {
+            .page { padding: 12px; }
+            .hero { border-radius: 14px; padding: 15px; }
+            .stats-grid { grid-template-columns: 1fr; }
+            .btn { width: 100%; }
+            .mode-tabs { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <main class="page">
+        <section class="hero">
+            <div class="hero-top">
+                <h1>Real-Time Pothole Detection Platform</h1>
+                <span class="mode-badge" id="active-mode-badge">Mode: Video Upload</span>
+            </div>
+            <p>Low-latency detection with threaded processing and direct phone-browser streaming via the /video endpoint.</p>
+        </section>
+
+        <section class="layout">
+            <article class="card viewer">
+                <div class="viewer-head">
+                    <strong>Live Detection Feed</strong>
+                    <span class="status-pill" id="status-pill">Idle</span>
+                </div>
+                <div class="feed-wrap"><img id="feed" alt="Detection Stream" /></div>
+                <p class="hint" id="status-message">Select a mode and source, then press Start Detection.</p>
+            </article>
+
+            <aside class="card sidebar">
+                <div class="section">
+                    <h3>Mode Selection</h3>
+                    <div class="mode-tabs">
+                        <button class="tab active" id="tab-upload">Video Upload Mode</button>
+                        <button class="tab" id="tab-phone">Phone Browser Mode</button>
+                        <button class="tab" id="tab-stream">RTSP/IP Mode</button>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <h3>Source Input</h3>
+                    <div id="upload-controls" style="display:grid; gap:8px;">
+                        <input type="file" id="video-file" accept="video/mp4,video/avi,video/mov,video/mkv" />
+                        <button class="btn" id="upload-btn">Upload Selected Video</button>
+                    </div>
+                    <div id="phone-controls" style="display:grid; gap:8px; margin-top:8px;">
+                        <input type="text" id="phone-endpoint" value="/video" readonly disabled />
+                    </div>
+                    <div id="stream-controls" style="display:grid; gap:8px; margin-top:8px;">
+                        <input type="text" id="stream-url" placeholder="rtsp://192.168.1.10:554/stream" />
+                        <button class="btn" id="set-stream-btn">Set Stream URL</button>
+                    </div>
+                    <p class="hint" style="margin-top:8px;">Open this link on your phone browser and tap Start Camera to stream frames.</p>
+                </div>
+
+                <div class="section">
+                    <h3>Detection Controls</h3>
+                    <div class="row">
+                        <button class="btn primary" id="start-btn">Start Detection</button>
+                        <button class="btn stop" id="stop-btn">Stop Detection</button>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <h3>Calibration (Optional)</h3>
+                    <div style="display:grid; gap:8px;">
+                        <input type="number" id="ref-cm" min="0" step="0.1" placeholder="Reference size (cm)" />
+                        <input type="number" id="ref-px" min="0" step="0.1" placeholder="Reference size (px)" />
+                    </div>
+                    <div class="row" style="margin-top:8px;">
+                        <button class="btn" id="apply-calib">Apply</button>
+                        <button class="btn" id="reset-calib">Reset</button>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <h3>Live Stats</h3>
+                    <div class="stats-grid">
+                        <div class="stat"><p class="k">Status</p><p class="v" id="st-status">idle</p></div>
+                        <div class="stat"><p class="k">Device</p><p class="v" id="st-device">CPU</p></div>
+                        <div class="stat"><p class="k">Detections</p><p class="v" id="st-detections">0</p></div>
+                        <div class="stat"><p class="k">Capture FPS</p><p class="v" id="st-cfps">0.0</p></div>
+                        <div class="stat"><p class="k">Inference FPS</p><p class="v" id="st-ifps">0.0</p></div>
+                        <div class="stat"><p class="k">Stream FPS</p><p class="v" id="st-sfps">0.0</p></div>
+                        <div class="stat"><p class="k">Latency</p><p class="v" id="st-lat">0 ms</p></div>
+                        <div class="stat"><p class="k">Avg Confidence</p><p class="v" id="st-conf">0.00</p></div>
+                        <div class="stat"><p class="k">Avg Width</p><p class="v" id="st-width">0.0 cm</p></div>
+                        <div class="stat"><p class="k">Avg Area</p><p class="v" id="st-area">0.00 m2</p></div>
+                        <div class="stat"><p class="k">Avg Depth</p><p class="v" id="st-depth">0.0 cm</p></div>
+                        <div class="stat"><p class="k">Depth Class</p><p class="v" id="st-dclass">none</p></div>
+                    </div>
+                </div>
+            </aside>
+        </section>
+
+        <p class="footer">Optimized for low-latency pothole analytics with explicit mode awareness and phone/IP stream support.</p>
+    </main>
+
+    <script>
+        const feed = document.getElementById("feed");
+        let activeMode = "upload";
+
+        async function postJSON(url, payload = {}) {
+            const response = await fetch(url, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            });
+            return response.json();
+        }
+
+        function updateModeUI() {
+            const isUpload = activeMode === "upload";
+            const isPhone = activeMode === "phone";
+            const isStream = activeMode === "stream";
+
+            document.getElementById("tab-upload").classList.toggle("active", isUpload);
+            document.getElementById("tab-phone").classList.toggle("active", isPhone);
+            document.getElementById("tab-stream").classList.toggle("active", isStream);
+
+            document.getElementById("video-file").disabled = !isUpload;
+            document.getElementById("upload-btn").disabled = !isUpload;
+            document.getElementById("stream-url").disabled = !isStream;
+            document.getElementById("set-stream-btn").disabled = !isStream;
+
+            document.getElementById("active-mode-badge").textContent = isUpload
+                ? "Mode: Video Upload"
+                : (isPhone ? "Mode: Phone Browser" : "Mode: RTSP/IP Stream");
+        }
+
+        async function switchMode(mode) {
+            const data = await postJSON("/select_mode", { mode });
+            if (!data.ok) {
+                alert(data.error || "Failed to switch mode.");
+                return;
+            }
+            activeMode = mode;
+            updateModeUI();
+        }
+
+        async function uploadVideo() {
+            const fileInput = document.getElementById("video-file");
+            if (!fileInput.files.length) {
+                alert("Choose a video file first.");
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append("video", fileInput.files[0]);
+
+            const response = await fetch("/upload_video", { method: "POST", body: formData });
+            const data = await response.json();
+
+            if (!data.ok) {
+                alert(data.error || "Upload failed.");
+                return;
+            }
+
+            activeMode = "upload";
+            updateModeUI();
+            alert(`Video ready: ${data.filename}`);
+        }
+
+        async function startDetection() {
+            const data = await postJSON("/start_detection");
+            if (!data.ok) {
+                alert(data.error || "Unable to start detection.");
+                return;
+            }
+            feed.src = `${data.video_url}?t=${Date.now()}`;
+        }
+
+        async function setStreamSource() {
+            const streamUrl = document.getElementById("stream-url").value.trim();
+            if (!streamUrl) {
+                alert("Enter an RTSP/IP stream URL first.");
+                return;
+            }
+
+            const data = await postJSON("/set_stream_source", { stream_url: streamUrl });
+            if (!data.ok) {
+                alert(data.error || "Failed to set stream URL.");
+                return;
+            }
+
+            activeMode = "stream";
+            updateModeUI();
+            alert("RTSP/IP stream source configured.");
+        }
+
+        async function stopDetection() {
+            await postJSON("/stop_detection");
+        }
+
+        async function applyCalibration() {
+            const cm = document.getElementById("ref-cm").value;
+            const px = document.getElementById("ref-px").value;
+            const data = await postJSON("/set_calibration", { reference_cm: cm, reference_px: px });
+            if (!data.ok) {
+                alert(data.error || "Calibration failed.");
+                return;
+            }
+            alert(data.message);
+        }
+
+        async function resetCalibration() {
+            const data = await postJSON("/set_calibration", { reference_cm: null, reference_px: null });
+            document.getElementById("ref-cm").value = "";
+            document.getElementById("ref-px").value = "";
+            alert(data.message || "Calibration reset.");
+        }
+
+        function styleStatusPill(status) {
+            const pill = document.getElementById("status-pill");
+            pill.classList.remove("running", "warning", "stopped", "idle");
+            if (["running", "warning", "stopped", "idle"].includes(status)) {
+                pill.classList.add(status);
+            }
+            pill.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+        }
+
+        async function updateStats() {
+            try {
+                const response = await fetch("/detection_stats");
+                const s = await response.json();
+
+                styleStatusPill(s.status || "idle");
+                document.getElementById("status-message").textContent = s.status_message || "";
+                const phoneEndpoint = document.getElementById("phone-endpoint");
+                phoneEndpoint.value = `${window.location.origin}${s.phone_endpoint || "/video"}`;
+
+                activeMode = s.mode || activeMode;
+                updateModeUI();
+
+                document.getElementById("st-status").textContent = s.status || "idle";
+                document.getElementById("st-device").textContent = s.device || "CPU";
+                document.getElementById("st-detections").textContent = s.detections ?? 0;
+                document.getElementById("st-cfps").textContent = Number(s.capture_fps || 0).toFixed(1);
+                document.getElementById("st-ifps").textContent = Number(s.infer_fps || 0).toFixed(1);
+                document.getElementById("st-sfps").textContent = Number(s.stream_fps || 0).toFixed(1);
+                document.getElementById("st-lat").textContent = `${Number(s.latency_ms || 0).toFixed(0)} ms`;
+                document.getElementById("st-conf").textContent = Number(s.avg_confidence || 0).toFixed(2);
+                document.getElementById("st-width").textContent = `${Number(s.avg_width_cm || 0).toFixed(1)} cm`;
+                document.getElementById("st-area").textContent = `${Number(s.avg_area_m2 || 0).toFixed(2)} m2`;
+                document.getElementById("st-depth").textContent = `${Number(s.avg_depth_cm || 0).toFixed(1)} cm`;
+
+                const dClass = document.getElementById("st-dclass");
+                dClass.textContent = s.depth_class || "none";
+                dClass.classList.toggle("severe", (s.depth_class || "") === "severe");
+            } catch (_e) {
+                // Ignore intermittent polling failures.
+            }
+        }
+
+        document.getElementById("tab-upload").addEventListener("click", () => switchMode("upload"));
+        document.getElementById("tab-phone").addEventListener("click", () => switchMode("phone"));
+        document.getElementById("tab-stream").addEventListener("click", () => switchMode("stream"));
+        document.getElementById("upload-btn").addEventListener("click", uploadVideo);
+        document.getElementById("set-stream-btn").addEventListener("click", setStreamSource);
+        document.getElementById("start-btn").addEventListener("click", startDetection);
+        document.getElementById("stop-btn").addEventListener("click", stopDetection);
+        document.getElementById("apply-calib").addEventListener("click", applyCalibration);
+        document.getElementById("reset-calib").addEventListener("click", resetCalibration);
+
+        updateModeUI();
+        updateStats();
+        setInterval(updateStats, 700);
+    </script>
+</body>
+</html>
