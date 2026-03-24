@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Login to the Real-Time Pothole Detection System." />
+    <title>Login – Pothole Detection System</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <style>
+        :root {
+            --bg: #0f1117;
+            --surface: rgba(255,255,255,0.04);
+            --surface-solid: #1a1d27;
+            --surface-hover: rgba(255,255,255,0.07);
+            --text: #e8eaed;
+            --text-secondary: #9aa0a6;
+            --muted: #6b7280;
+            --accent: #f4b400;
+            --accent-glow: rgba(244,180,0,0.25);
+            --accent-strong: #ffcc33;
+            --border: rgba(244,180,0,0.18);
+            --border-subtle: rgba(255,255,255,0.06);
+            --danger: #f87171;
+            --radius: 14px;
+            --radius-sm: 10px;
+            --shadow: 0 8px 32px rgba(0,0,0,0.35);
+            --glass: rgba(255,255,255,0.03);
+            --input-bg: rgba(255,255,255,0.04);
+        }
+
+        [data-theme="light"] {
+            --bg: #f5f3ee;
+            --surface: rgba(255,255,255,0.85);
+            --surface-solid: #ffffff;
+            --surface-hover: rgba(0,0,0,0.04);
+            --text: #1a1a2e;
+            --text-secondary: #555770;
+            --muted: #7c7f8a;
+            --accent: #d49a00;
+            --accent-glow: rgba(212,154,0,0.18);
+            --accent-strong: #b88300;
+            --border: rgba(180,140,0,0.22);
+            --border-subtle: rgba(0,0,0,0.08);
+            --danger: #dc2626;
+            --shadow: 0 6px 24px rgba(0,0,0,0.08);
+            --glass: rgba(255,255,255,0.7);
+            --input-bg: rgba(0,0,0,0.03);
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html { scroll-behavior: smooth; }
+
+        body {
+            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+            color: var(--text);
+            background: var(--bg);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            position: relative;
+            overflow: hidden;
+            line-height: 1.5;
+            transition: background 0.3s ease, color 0.3s ease;
+        }
+
+        /* Ambient glow blobs */
+        .bg-blob {
+            position: fixed;
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 0;
+            filter: blur(80px);
+            opacity: 0.45;
+        }
+        .bg-blob-1 {
+            width: 550px; height: 550px;
+            background: radial-gradient(circle, rgba(244,180,0,0.18) 0%, transparent 70%);
+            top: -180px; right: -150px;
+            animation: blobFloat 14s ease-in-out infinite;
+        }
+        .bg-blob-2 {
+            width: 450px; height: 450px;
+            background: radial-gradient(circle, rgba(244,180,0,0.1) 0%, transparent 70%);
+            bottom: -160px; left: -120px;
+            animation: blobFloat 18s ease-in-out infinite reverse;
+        }
+        @keyframes blobFloat {
+            0%, 100% { transform: translate(0,0) scale(1); }
+            40%       { transform: translate(25px,-18px) scale(1.06); }
+            70%       { transform: translate(-18px,14px) scale(0.95); }
+        }
+
+        /* Card */
+        .login-card {
+            position: relative;
+            z-index: 1;
+            width: 100%;
+            max-width: 440px;
+            background: var(--surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius);
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
+            box-shadow: var(--shadow);
+            padding: 40px 36px;
+            animation: cardIn 0.55s cubic-bezier(0.16,1,0.3,1);
+            transition: background 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease;
+        }
+        .login-card:hover {
+            border-color: var(--border);
+        }
+        @keyframes cardIn {
+            from { opacity:0; transform:translateY(22px) scale(0.97); }
+            to   { opacity:1; transform:translateY(0)    scale(1);    }
+        }
+
+        /* Theme toggle */
+        .theme-toggle {
+            position: absolute;
+            top: 16px; right: 16px;
+            background: var(--surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: 999px;
+            color: var(--text);
+            padding: 6px 12px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            cursor: pointer;
+            font-family: inherit;
+            display: flex; align-items: center; gap: 5px;
+            transition: all 0.3s ease;
+            white-space: nowrap;
+        }
+        .theme-toggle:hover { border-color: var(--accent); background: var(--surface-hover); }
+
+        /* Header */
+        .login-header { text-align: center; margin-bottom: 30px; }
+        .login-icon {
+            width: 64px; height: 64px;
+            background: linear-gradient(135deg, rgba(244,180,0,0.15), rgba(244,180,0,0.05));
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            display: flex; align-items: center; justify-content: center;
+            margin: 0 auto 16px;
+            font-size: 28px;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        .login-icon:hover {
+            transform: scale(1.05);
+            box-shadow: 0 0 24px var(--accent-glow);
+        }
+        .login-header h1 {
+            font-size: 1.5rem; font-weight: 800;
+            background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: -0.02em;
+            margin-bottom: 6px;
+        }
+        .login-header p { color: var(--text-secondary); font-size: 0.85rem; }
+
+        /* Error */
+        .error-message {
+            background: rgba(248,113,113,0.08);
+            color: var(--danger);
+            border: 1px solid rgba(248,113,113,0.25);
+            border-radius: var(--radius-sm);
+            padding: 11px 14px;
+            margin-bottom: 18px;
+            font-size: 0.82rem;
+            font-weight: 500;
+            display: none;
+            align-items: center; gap: 8px;
+            animation: shake 0.35s ease-out;
+        }
+        .error-message.show { display: flex; }
+        @keyframes shake {
+            0%,100% { transform: translateX(0); }
+            25%      { transform: translateX(-5px); }
+            75%      { transform: translateX(5px); }
+        }
+
+        /* Credentials box */
+        .credentials-box {
+            background: var(--glass);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 14px 16px;
+            margin-bottom: 22px;
+        }
+        .credentials-box h3 {
+            color: var(--accent);
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-weight: 700;
+            margin-bottom: 10px;
+        }
+        .cred-item {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 7px 0;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+        .cred-item:last-child { border-bottom: none; padding-bottom: 0; }
+        .cred-label { color: var(--text-secondary); font-size: 0.8rem; font-weight: 600; }
+        .cred-value {
+            color: var(--accent-strong);
+            font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+            font-weight: 700; font-size: 0.82rem;
+            background: rgba(244,180,0,0.08);
+            padding: 3px 10px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            user-select: all;
+            transition: background 0.2s ease;
+        }
+        .cred-value:hover { background: rgba(244,180,0,0.15); }
+
+        /* Form */
+        .form-group { margin-bottom: 16px; }
+        .form-group label {
+            display: block;
+            color: var(--text-secondary);
+            font-weight: 600; font-size: 0.75rem;
+            margin-bottom: 7px;
+            text-transform: uppercase; letter-spacing: 0.05em;
+        }
+        .input-wrapper { position: relative; }
+        .input-icon {
+            position: absolute; left: 13px; top: 50%;
+            transform: translateY(-50%);
+            font-size: 0.9rem; pointer-events: none;
+            color: var(--muted);
+            transition: color 0.2s ease;
+        }
+        .input-wrapper:focus-within .input-icon { color: var(--accent); }
+
+        .form-group input {
+            width: 100%;
+            padding: 12px 42px 12px 40px;
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            background: var(--input-bg);
+            color: var(--text);
+            font-size: 0.88rem; font-family: inherit;
+            transition: all 0.25s ease;
+        }
+        .form-group input::placeholder { color: var(--muted); opacity: 0.7; }
+        .form-group input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+            background: var(--surface-hover);
+        }
+
+        .pwd-toggle {
+            position: absolute; right: 12px; top: 50%;
+            transform: translateY(-50%);
+            background: none; border: none;
+            color: var(--muted); cursor: pointer;
+            font-size: 0.9rem; padding: 4px;
+            transition: color 0.2s ease;
+        }
+        .pwd-toggle:hover { color: var(--accent); }
+
+        /* Submit */
+        .login-btn {
+            width: 100%; padding: 13px;
+            background: linear-gradient(135deg, var(--accent), #e6a800);
+            border: 1px solid var(--accent);
+            border-radius: var(--radius-sm);
+            color: #1a1200;
+            font-size: 0.9rem; font-weight: 700;
+            cursor: pointer; font-family: inherit;
+            letter-spacing: 0.02em;
+            transition: all 0.25s ease;
+            box-shadow: 0 4px 16px var(--accent-glow);
+            margin-top: 8px;
+            position: relative; overflow: hidden;
+        }
+        .login-btn::before {
+            content: '';
+            position: absolute; inset: 0;
+            background: linear-gradient(135deg, rgba(255,255,255,0.18), transparent);
+            opacity: 0; transition: opacity 0.3s ease;
+        }
+        .login-btn:hover { transform: translateY(-2px); box-shadow: 0 6px 28px rgba(244,180,0,0.42); }
+        .login-btn:hover::before { opacity: 1; }
+        .login-btn:active { transform: translateY(0); box-shadow: 0 2px 12px var(--accent-glow); }
+
+        /* Divider */
+        .divider {
+            display: flex; align-items: center; gap: 12px;
+            margin: 22px 0 14px;
+        }
+        .divider::before, .divider::after {
+            content: ''; flex: 1; height: 1px;
+            background: var(--border-subtle);
+        }
+        .divider span {
+            color: var(--muted); font-size: 0.72rem;
+            text-transform: uppercase; letter-spacing: 0.06em; font-weight: 500;
+        }
+
+        /* Footer */
+        .login-footer {
+            text-align: center; color: var(--muted);
+            font-size: 0.75rem; line-height: 1.6;
+        }
+        .login-footer span { color: var(--accent); font-weight: 600; }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: var(--bg); }
+        ::-webkit-scrollbar-thumb { background: rgba(244,180,0,0.2); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(244,180,0,0.35); }
+
+        @media (max-width: 500px) {
+            .login-card { padding: 28px 20px; }
+            .login-header h1 { font-size: 1.25rem; }
+            .login-icon { width: 52px; height: 52px; font-size: 22px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="bg-blob bg-blob-1"></div>
+    <div class="bg-blob bg-blob-2"></div>
+
+    <div class="login-card">
+        <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">🌙 Dark</button>
+
+        <div class="login-header">
+            <div class="login-icon">⚡</div>
+            <h1>Pothole Detection</h1>
+            <p>Sign in to access the real-time detection dashboard</p>
+        </div>
+
+        {% if error %}
+        <div class="error-message show">⚠️ {{ error }}</div>
+        {% endif %}
+
+        <div class="credentials-box">
+            <h3>📋 Demo Credentials</h3>
+            <div class="cred-item">
+                <span class="cred-label">Email</span>
+                <span class="cred-value">admin@acubeai</span>
+            </div>
+            <div class="cred-item">
+                <span class="cred-label">Password</span>
+                <span class="cred-value">admin123</span>
+            </div>
+        </div>
+
+        <form method="POST" onsubmit="validateForm(event)">
+            <div class="form-group">
+                <label for="email">Email Address</label>
+                <div class="input-wrapper">
+                    <span class="input-icon">✉️</span>
+                    <input type="email" id="email" name="email"
+                           placeholder="admin@acubeai" required autocomplete="off" />
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label for="password">Password</label>
+                <div class="input-wrapper">
+                    <span class="input-icon">🔒</span>
+                    <input type="password" id="password" name="password"
+                           placeholder="••••••••" required autocomplete="off" />
+                    <button type="button" class="pwd-toggle" id="pwd-toggle" aria-label="Show/hide password">👁️</button>
+                </div>
+            </div>
+
+            <button type="submit" class="login-btn">Sign In →</button>
+        </form>
+
+        <div class="divider"><span>Secured Access</span></div>
+
+        <div class="login-footer">
+            Powered by <span>YOLO AI</span> · Real-Time Road Safety
+        </div>
+    </div>
+
+    <script>
+        // Form validation
+        function validateForm(e) {
+            const email = document.getElementById('email').value.trim();
+            const pwd   = document.getElementById('password').value.trim();
+            if (!email || !pwd) { e.preventDefault(); alert('Please fill in all fields'); }
+        }
+
+        // Password toggle
+        document.getElementById('pwd-toggle').addEventListener('click', function () {
+            const inp = document.getElementById('password');
+            const show = inp.type === 'password';
+            inp.type = show ? 'text' : 'password';
+            this.textContent = show ? '🙈' : '👁️';
+        });
+
+        // Theme – synced with index.html via localStorage key "pothole-theme"
+        function applyTheme(theme) {
+            document.documentElement.setAttribute('data-theme', theme);
+            document.getElementById('theme-toggle').textContent =
+                theme === 'light' ? '☀️ Light' : '🌙 Dark';
+            localStorage.setItem('pothole-theme', theme);
+        }
+
+        applyTheme(localStorage.getItem('pothole-theme') || 'dark');
+
+        document.getElementById('theme-toggle').addEventListener('click', function () {
+            const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+            applyTheme(cur === 'dark' ? 'light' : 'dark');
+        });
+
+        // Pre-fill demo credentials via ?demo=true
+        window.addEventListener('load', function () {
+            if (new URLSearchParams(window.location.search).get('demo') === 'true') {
+                document.getElementById('email').value    = 'admin@acubeai';
+                document.getElementById('password').value = 'admin123';
+                document.getElementById('email').focus();
+            }
+        });
+    </script>
+</body>
+</html>

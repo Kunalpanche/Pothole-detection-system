@@ -1,18 +1,21 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import io
 import os
+import queue
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+from functools import wraps
 
 import cv2
 import numpy as np
 import supervision as sv
 import torch
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, send_from_directory, session, redirect, url_for
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
@@ -22,10 +25,13 @@ from ultralytics.nn.modules.block import AAttn
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "pothole_detection_secret_key_2024")
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
+SCREENSHOT_DIR = BASE_DIR / "screenshots"
+SCREENSHOT_DIR.mkdir(exist_ok=True)
 
 MODEL_PATH = os.getenv("POTHOLE_MODEL_PATH", str(BASE_DIR / "best.pt"))
 DEFAULT_VIDEO = str(BASE_DIR / "demo2.mp4")
@@ -38,6 +44,22 @@ ALLOWED_EXTENSIONS = {"mp4", "avi", "mov", "mkv"}
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "512"))
 
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+# Demo credentials
+DEMO_CREDENTIALS = {
+    "email": "admin@acubeai",
+    "password": "admin123"
+}
+
+SAMPLE_VIDEOS_DIR = BASE_DIR / "sample_videos"
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if "user" not in session:
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return decorated_function
 
 
 def _patch_aattn_compat() -> None:
@@ -135,6 +157,7 @@ class DetectionEngine:
         self.capture_thread: Optional[threading.Thread] = None
         self.infer_thread: Optional[threading.Thread] = None
         self.capture: Optional[cv2.VideoCapture] = None
+        self.frame_queue: queue.Queue[Tuple[np.ndarray, float, float]] = queue.Queue(maxsize=4)
 
         self.mode = "upload"
         self.source_path = DEFAULT_VIDEO
@@ -147,12 +170,6 @@ class DetectionEngine:
 
         self.reference_cm: Optional[float] = None
         self.reference_px: Optional[float] = None
-
-        self.latest_frame: Optional[np.ndarray] = None
-        self.latest_frame_id = 0
-        self.latest_capture_ts = 0.0
-        self.latest_timeline_s = 0.0
-        self.last_processed_id = -1
 
         self.latest_jpeg = self._make_status_frame("Idle. Select source and press Start.")
         self.latest_jpeg_id = 0
@@ -174,6 +191,13 @@ class DetectionEngine:
         self.detection_log: List[Dict[str, object]] = []
         self.max_log_rows = 5000
         self.log_seq = 0
+
+        # IOU-based deduplication tracker
+        # Each entry: {"xyxy": np.ndarray, "last_seen": float, "pothole_id": int}
+        self._tracked_potholes: List[Dict] = []
+        self._track_iou_threshold = 0.5
+        self._track_expiry_seconds = 2.0  # forget a pothole after 2s without re-detection
+        self._next_pothole_uid = 0
 
         self.stats: Dict[str, object] = {
             "detections": 0,
@@ -211,6 +235,35 @@ class DetectionEngine:
         cv2.putText(frame, text, (30, 235), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (45, 45, 45), 2)
         ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         return buffer.tobytes() if ok else b""
+
+    def _reset_frame_queue(self) -> None:
+        while True:
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _enqueue_frame(self, frame: np.ndarray, timeline_s: float, capture_ts: float) -> None:
+        payload = (frame, timeline_s, capture_ts)
+        try:
+            self.frame_queue.put(payload, block=True, timeout=0.5)
+        except queue.Full:
+            # Only drop the oldest frame if the queue is truly stuck
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.frame_queue.put(payload, block=False)
+            except queue.Full:
+                pass
+
+    def _save_screenshot(self, frame: np.ndarray, total_count: int) -> str:
+        timestamp_ms = int(time.time() * 1000)
+        filename = f"pothole_{total_count}_{timestamp_ms}.jpg"
+        path = SCREENSHOT_DIR / filename
+        ok = cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+        return filename if ok else ""
 
     def _estimate_metrics(
         self,
@@ -261,6 +314,48 @@ class DetectionEngine:
 
         return width_cm, length_cm, area_m2, depth_cm, d_class, estimate_conf
 
+    @staticmethod
+    def _compute_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
+        """Compute Intersection over Union between two [x1,y1,x2,y2] boxes."""
+        x1 = max(box_a[0], box_b[0])
+        y1 = max(box_a[1], box_b[1])
+        x2 = min(box_a[2], box_b[2])
+        y2 = min(box_a[3], box_b[3])
+        inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        area_a = max(0.0, box_a[2] - box_a[0]) * max(0.0, box_a[3] - box_a[1])
+        area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    def _is_duplicate_pothole(self, xyxy: np.ndarray, now: float) -> bool:
+        """Check if this detection matches any tracked pothole (IOU > threshold).
+        If matched, update the tracked entry's last_seen. If not, register as new.
+        Returns True if duplicate (already tracked), False if new.
+        """
+        # Expire old tracked potholes
+        self._tracked_potholes = [
+            t for t in self._tracked_potholes
+            if (now - t["last_seen"]) < self._track_expiry_seconds
+        ]
+
+        # Check against existing tracked potholes
+        for tracked in self._tracked_potholes:
+            iou = self._compute_iou(xyxy, tracked["xyxy"])
+            if iou > self._track_iou_threshold:
+                # Same pothole — update position and timestamp
+                tracked["xyxy"] = xyxy.copy()
+                tracked["last_seen"] = now
+                return True
+
+        # New pothole — register it
+        self._next_pothole_uid += 1
+        self._tracked_potholes.append({
+            "xyxy": xyxy.copy(),
+            "last_seen": now,
+            "pothole_id": self._next_pothole_uid,
+        })
+        return False
+
     def _annotate_and_stats(self, frame: np.ndarray, timeline_s: float) -> np.ndarray:
         infer_start = time.perf_counter()
 
@@ -270,21 +365,22 @@ class DetectionEngine:
             scale = self.infer_imgsz / float(w)
             proc_frame = cv2.resize(proc_frame, (self.infer_imgsz, int(h * scale)), interpolation=cv2.INTER_AREA)
 
-        result = self.model.predict(
-            source=proc_frame,
-            conf=0.45,
-            iou=0.5,
-            imgsz=self.infer_imgsz,
-            device=self.device,
-            half=self.use_half,
-            verbose=False,
-        )[0]
+        with torch.no_grad():
+            result = self.model.predict(
+                source=proc_frame,
+                conf=0.35,
+                iou=0.45,
+                imgsz=self.infer_imgsz,
+                device=self.device,
+                half=self.use_half,
+                verbose=False,
+            )[0]
 
         detections = sv.Detections.from_ultralytics(result)
         if len(detections) > 0:
             widths = detections.xyxy[:, 2] - detections.xyxy[:, 0]
             heights = detections.xyxy[:, 3] - detections.xyxy[:, 1]
-            keep_mask = (widths * heights) > 480
+            keep_mask = (widths * heights) > 200
             detections = detections[keep_mask]
 
         annotated = self.box_annotator.annotate(scene=proc_frame.copy(), detections=detections)
@@ -345,17 +441,29 @@ class DetectionEngine:
 
         with self.lock:
             detections_in_frame = int(len(detections))
-            if detections_in_frame > 0:
-                if self.session_first_detection_ts is None:
-                    self.session_first_detection_ts = now_epoch
-                self.total_potholes += detections_in_frame
+            if detections_in_frame > 0 and self.session_first_detection_ts is None:
+                self.session_first_detection_ts = now_epoch
 
+            # Deduplicate: only log truly new potholes
+            new_log_rows: List[Dict[str, object]] = []
             if detections_in_frame > 0:
-                for row in log_rows:
-                    self.log_seq += 1
-                    row["id"] = self.log_seq
-                    row["total_count"] = self.total_potholes
-                    self.detection_log.append(row)
+                for idx_row, row in enumerate(log_rows):
+                    xyxy_for_row = detections.xyxy[idx_row]
+                    is_dup = self._is_duplicate_pothole(xyxy_for_row, now_epoch)
+                    if not is_dup:
+                        self.total_potholes += 1
+                        self.log_seq += 1
+                        row["id"] = self.log_seq
+                        row["total_count"] = self.total_potholes
+                        try:
+                            shot_name = self._save_screenshot(annotated, self.total_potholes)
+                        except Exception:
+                            shot_name = ""
+                        row["screenshot"] = f"/screenshots/{shot_name}" if shot_name else ""
+                        new_log_rows.append(row)
+
+            for row in new_log_rows:
+                self.detection_log.append(row)
 
             if len(self.detection_log) > self.max_log_rows:
                 self.detection_log = self.detection_log[-self.max_log_rows :]
@@ -443,10 +551,6 @@ class DetectionEngine:
             )
             self.last_error = ""
             self.stop_event.clear()
-            self.latest_frame = None
-            self.latest_frame_id = 0
-            self.latest_timeline_s = 0.0
-            self.last_processed_id = -1
             self.prev_capture_ts = 0.0
             self.prev_stream_ts = 0.0
             self.phone_last_frame_ts = 0.0
@@ -458,9 +562,12 @@ class DetectionEngine:
             self.total_potholes = 0
             self.log_seq = 0
             self.detection_log = []
+            self._tracked_potholes = []
+            self._next_pothole_uid = 0
             self.stats["detections"] = 0
             self.stats["total_potholes"] = 0
             self.stats["detections_per_min"] = 0.0
+            self._reset_frame_queue()
 
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True) if mode in {"upload", "stream"} else None
         self.infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
@@ -494,6 +601,20 @@ class DetectionEngine:
         consecutive_failures = 0
         last_reconnect_ts = 0.0
 
+        # Read source FPS for upload mode to sync playback
+        source_fps = 0.0
+        with self.lock:
+            cap_init = self.capture
+            mode_init = self.mode
+        if cap_init is not None and mode_init == "upload":
+            source_fps = float(cap_init.get(cv2.CAP_PROP_FPS) or 0.0)
+            if source_fps <= 0 or source_fps > 120:
+                source_fps = 25.0  # sensible fallback
+            with self.lock:
+                self.upload_source_fps = source_fps
+
+        prev_frame_time = time.perf_counter()
+
         while not self.stop_event.is_set():
             with self.lock:
                 cap = self.capture
@@ -507,6 +628,7 @@ class DetectionEngine:
 
             if mode == "upload" and paused:
                 time.sleep(0.03)
+                prev_frame_time = time.perf_counter()
                 continue
 
             if mode == "stream":
@@ -568,42 +690,32 @@ class DetectionEngine:
             self.prev_capture_ts = now
 
             with self.lock:
-                self.latest_frame = frame
-                self.latest_capture_ts = now
-                self.latest_timeline_s = timeline_s
-                self.latest_frame_id += 1
                 self.stats["capture_fps"] = self.capture_fps_ema
 
-            if mode == "upload":
-                if self.upload_source_fps <= 0:
-                    fps_candidate = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-                    if fps_candidate > 0:
-                        with self.lock:
-                            self.upload_source_fps = fps_candidate
-                target_fps = self.upload_source_fps if self.upload_source_fps > 0 else 24.0
-                paced_fps = max(1.0, target_fps * max(0.1, min(speed, 2.0)))
-                time.sleep(1.0 / paced_fps)
+            self._enqueue_frame(frame, timeline_s, now)
+
+            # FPS-synced sleep for upload mode so video plays at correct speed
+            if mode == "upload" and source_fps > 0:
+                target_interval = 1.0 / (source_fps * max(speed, 0.1))
+                elapsed = time.perf_counter() - prev_frame_time
+                sleep_time = target_interval - elapsed
+                if sleep_time > 0.001:
+                    time.sleep(sleep_time)
+                prev_frame_time = time.perf_counter()
+                continue
 
     def _infer_loop(self) -> None:
         while not self.stop_event.is_set():
             with self.lock:
-                frame = None if self.latest_frame is None else self.latest_frame.copy()
-                frame_id = self.latest_frame_id
-                capture_ts = self.latest_capture_ts
-                timeline_s = self.latest_timeline_s
                 running = self.running
 
             if not running:
                 time.sleep(0.02)
                 continue
 
-            if frame is None or frame_id == self.last_processed_id:
-                time.sleep(0.004)
-                continue
-
-            target_gap = max(1, int(self.infer_ms_ema / 24.0))
-            if frame_id - self.last_processed_id < target_gap:
-                time.sleep(0.003)
+            try:
+                frame, timeline_s, capture_ts = self.frame_queue.get(timeout=0.2)
+            except queue.Empty:
                 continue
 
             try:
@@ -627,15 +739,9 @@ class DetectionEngine:
 
             latency_ms = (now - capture_ts) * 1000.0
 
-            # Skip publishing stale frames when pipeline delay exceeds target budget.
-            if latency_ms > (self.target_latency_ms * 2.0):
-                self.last_processed_id = frame_id
-                continue
-
             with self.lock:
                 self.latest_jpeg = buffer.tobytes()
                 self.latest_jpeg_id += 1
-                self.last_processed_id = frame_id
                 self.stats["stream_fps"] = self.stream_fps_ema
                 self.stats["latency_ms"] = latency_ms
 
@@ -647,7 +753,7 @@ class DetectionEngine:
                 payload_id = self.latest_jpeg_id
 
             if payload_id == last_jpeg_id:
-                time.sleep(0.004)
+                time.sleep(0.008)
                 continue
 
             last_jpeg_id = payload_id
@@ -773,15 +879,14 @@ class DetectionEngine:
                 self.capture_fps_ema = self._ema(self.capture_fps_ema, capture_fps, 0.15)
             self.prev_capture_ts = now
             self.phone_last_frame_ts = now
-            self.latest_frame = frame
-            self.latest_capture_ts = now
-            self.latest_timeline_s = max(0.0, time.time() - self.session_started_ts)
-            self.latest_frame_id += 1
             self.stats["capture_fps"] = self.capture_fps_ema
             if self.running and self.mode == "phone":
                 self.status = "running"
                 self.status_message = "Streaming from phone camera"
                 self.last_error = ""
+
+        timeline_s = max(0.0, time.time() - self.session_started_ts)
+        self._enqueue_frame(frame, timeline_s, now)
 
     def set_calibration(self, ref_cm: Optional[float], ref_px: Optional[float]) -> None:
         with self.lock:
@@ -792,17 +897,48 @@ class DetectionEngine:
 engine = DetectionEngine()
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        email = request.form.get("email", "").strip()
+        password = request.form.get("password", "").strip()
+        
+        if email == DEMO_CREDENTIALS["email"] and password == DEMO_CREDENTIALS["password"]:
+            session["user"] = email
+            return redirect(url_for("index"))
+        else:
+            return render_template("login.html", error="Invalid email or password")
+    
+    return render_template("login.html")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
 @app.route("/")
 def index():
+    if "user" not in session:
+        return redirect(url_for("login"))
     return render_template("index.html")
 
 
 @app.route("/video")
+@login_required
 def phone_video():
     return render_template("video.html")
 
 
+@app.route("/screenshots/<path:filename>")
+@login_required
+def screenshot_file(filename: str):
+    return send_from_directory(str(SCREENSHOT_DIR), filename)
+
+
 @app.route("/upload_video", methods=["POST"])
+@login_required
 def upload_video():
     file = request.files.get("video")
     if not file or file.filename == "":
@@ -835,6 +971,7 @@ def upload_video():
 
 
 @app.route("/video_frame", methods=["POST"])
+@login_required
 def video_frame():
     file = request.files.get("frame")
     frame_bytes = file.read() if file is not None else request.get_data(cache=False)
@@ -851,6 +988,7 @@ def video_frame():
 
 
 @app.route("/select_mode", methods=["POST"])
+@login_required
 def select_mode():
     payload = request.get_json(silent=True) or {}
     mode = str(payload.get("mode", "upload"))
@@ -864,6 +1002,7 @@ def select_mode():
 
 
 @app.route("/set_stream_source", methods=["POST"])
+@login_required
 def set_stream_source():
     payload = request.get_json(silent=True) or {}
     stream_url = str(payload.get("stream_url", "")).strip()
@@ -881,6 +1020,7 @@ def set_stream_source():
 
 
 @app.route("/set_calibration", methods=["POST"])
+@login_required
 def set_calibration():
     payload = request.get_json(silent=True) or {}
     ref_cm_raw = payload.get("reference_cm")
@@ -904,6 +1044,7 @@ def set_calibration():
 
 
 @app.route("/set_upload_playback", methods=["POST"])
+@login_required
 def set_upload_playback():
     payload = request.get_json(silent=True) or {}
 
@@ -927,6 +1068,7 @@ def set_upload_playback():
 
 
 @app.route("/detection_log")
+@login_required
 def detection_log():
     since_id_raw = request.args.get("since_id", "0")
     try:
@@ -1039,6 +1181,7 @@ def _draw_report_pdf(report: Dict[str, object]) -> bytes:
 
 
 @app.route("/download_report")
+@login_required
 def download_report():
     report = engine.build_report_data()
     pdf_bytes = _draw_report_pdf(report)
@@ -1051,6 +1194,7 @@ def download_report():
 
 
 @app.route("/start_detection", methods=["POST"])
+@login_required
 def start_detection():
     ok, message = engine.start()
     if not ok:
@@ -1059,19 +1203,50 @@ def start_detection():
 
 
 @app.route("/stop_detection", methods=["POST"])
+@login_required
 def stop_detection():
     engine.stop()
     return jsonify({"ok": True})
 
 
 @app.route("/video_feed")
+@login_required
 def video_feed():
     return Response(engine.generate_stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.route("/detection_stats")
+@login_required
 def detection_stats():
     return jsonify(engine.get_snapshot())
+
+
+@app.route("/download_samples")
+@login_required
+def download_samples():
+    """Download sample videos as a ZIP file"""
+    try:
+        # Create a ZIP file in memory
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            # List of sample video files to include
+            sample_videos = ["demo.mp4", "demo1.mp4", "demo2.mp4"]
+            
+            for video_name in sample_videos:
+                video_path = SAMPLE_VIDEOS_DIR / video_name
+                if video_path.exists():
+                    # Add file to ZIP with just the filename (not full path)
+                    zip_file.write(str(video_path), arcname=video_name)
+        
+        zip_buffer.seek(0)
+        filename = f"sample_videos_{int(time.time())}.zip"
+        return Response(
+            zip_buffer.getvalue(),
+            mimetype="application/zip",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.errorhandler(413)

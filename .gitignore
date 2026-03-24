@@ -3,7 +3,7 @@ venv/
 .env/
 env/
 ENV/
-
+screenshots/
 # Python Cache
 __pycache__/
 *.pyc
