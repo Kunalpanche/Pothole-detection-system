@@ -148,7 +148,7 @@ class DetectionEngine:
 
         self.box_annotator = sv.BoxAnnotator(thickness=2, color=sv.Color.from_hex("#f4b400"))
         self.label_annotator = sv.LabelAnnotator(
-            text_scale=0.52,
+            text_scale=0.45,
             text_thickness=1,
             text_color=sv.Color.BLACK,
             color=sv.Color.from_hex("#f4b400"),
@@ -196,12 +196,9 @@ class DetectionEngine:
         self.max_log_rows = 5000
         self.log_seq = 0
 
-        # IOU-based deduplication tracker
-        # Each entry: {"xyxy": np.ndarray, "last_seen": float, "pothole_id": int}
-        self._tracked_potholes: List[Dict] = []
-        self._track_iou_threshold = 0.5
-        self._track_expiry_seconds = 2.0  # forget a pothole after 2s without re-detection
-        self._next_pothole_uid = 0
+        # ByteTrack deduplication tracker
+        self.tracker = sv.ByteTrack()
+        self.seen_pothole_ids = set()
 
         self.stats: Dict[str, object] = {
             "detections": 0,
@@ -318,47 +315,7 @@ class DetectionEngine:
 
         return width_cm, length_cm, area_m2, depth_cm, d_class, estimate_conf
 
-    @staticmethod
-    def _compute_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
-        """Compute Intersection over Union between two [x1,y1,x2,y2] boxes."""
-        x1 = max(box_a[0], box_b[0])
-        y1 = max(box_a[1], box_b[1])
-        x2 = min(box_a[2], box_b[2])
-        y2 = min(box_a[3], box_b[3])
-        inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-        area_a = max(0.0, box_a[2] - box_a[0]) * max(0.0, box_a[3] - box_a[1])
-        area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
-        union = area_a + area_b - inter
-        return inter / union if union > 0 else 0.0
 
-    def _is_duplicate_pothole(self, xyxy: np.ndarray, now: float) -> bool:
-        """Check if this detection matches any tracked pothole (IOU > threshold).
-        If matched, update the tracked entry's last_seen. If not, register as new.
-        Returns True if duplicate (already tracked), False if new.
-        """
-        # Expire old tracked potholes
-        self._tracked_potholes = [
-            t for t in self._tracked_potholes
-            if (now - t["last_seen"]) < self._track_expiry_seconds
-        ]
-
-        # Check against existing tracked potholes
-        for tracked in self._tracked_potholes:
-            iou = self._compute_iou(xyxy, tracked["xyxy"])
-            if iou > self._track_iou_threshold:
-                # Same pothole — update position and timestamp
-                tracked["xyxy"] = xyxy.copy()
-                tracked["last_seen"] = now
-                return True
-
-        # New pothole — register it
-        self._next_pothole_uid += 1
-        self._tracked_potholes.append({
-            "xyxy": xyxy.copy(),
-            "last_seen": now,
-            "pothole_id": self._next_pothole_uid,
-        })
-        return False
 
     def _annotate_and_stats(self, frame: np.ndarray, timeline_s: float) -> np.ndarray:
         infer_start = time.perf_counter()
@@ -386,8 +343,40 @@ class DetectionEngine:
             heights = detections.xyxy[:, 3] - detections.xyxy[:, 1]
             keep_mask = (widths * heights) > 200
             detections = detections[keep_mask]
+            
+        detections = self.tracker.update_with_detections(detections)
 
-        annotated = self.box_annotator.annotate(scene=proc_frame.copy(), detections=detections)
+        # --- Dynamic Annotation Logic ---
+        img_h, img_w = proc_frame.shape[:2]
+        num_dets = len(detections)
+        
+        # Base scale relative to 640px width (e.g. 0.8 for 512px)
+        # We start smaller than default because user said "too large"
+        res_scale = img_w / 640.0 * 0.9
+        
+        # Dampen parameters if scene is crowded
+        crowd_factor = 1.0
+        if num_dets > 4:
+            crowd_factor = 0.85
+        if num_dets > 8:
+            crowd_factor = 0.7
+
+        box_thickness = max(1, int(2 * res_scale * crowd_factor))
+        text_scale = max(0.35, 0.45 * res_scale * crowd_factor)
+        text_padding = max(2, int(5 * res_scale * crowd_factor))
+        text_thickness = 1
+
+        # Use temporary annotators with dynamic settings
+        box_annotator = sv.BoxAnnotator(thickness=box_thickness, color=sv.Color.from_hex("#f4b400"))
+        label_annotator = sv.LabelAnnotator(
+            text_scale=text_scale,
+            text_thickness=text_thickness,
+            text_color=sv.Color.BLACK,
+            color=sv.Color.from_hex("#f4b400"),
+            text_padding=text_padding,
+        )
+
+        annotated = box_annotator.annotate(scene=proc_frame.copy(), detections=detections)
 
         gray = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2GRAY)
         confs = detections.confidence if detections.confidence is not None else []
@@ -407,8 +396,10 @@ class DetectionEngine:
             width_cm, length_cm, area_m2, depth_cm, d_class, est_conf = self._estimate_metrics(gray, xyxy, proc_frame.shape)
             conf = float(confs[idx]) if len(confs) > idx else 0.0
 
+            # Compact label format: "12x15cm D:5cm"
+            # Removed redundant text to save space
             labels.append(
-                f"conf {conf:.2f} | l {length_cm:.1f}cm | w {width_cm:.1f}cm | depth {depth_cm:.1f}cm ({d_class})"
+                f"{length_cm:.0f}x{width_cm:.0f}cm | D:{depth_cm:.1f}cm"
             )
 
             length_values.append(length_cm)
@@ -431,7 +422,7 @@ class DetectionEngine:
                 }
             )
 
-        annotated = self.label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
+        annotated = label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
 
         infer_ms = (time.perf_counter() - infer_start) * 1000.0
         self.infer_ms_ema = self._ema(self.infer_ms_ema, infer_ms, 0.2)
@@ -453,8 +444,17 @@ class DetectionEngine:
             if detections_in_frame > 0:
                 for idx_row, row in enumerate(log_rows):
                     xyxy_for_row = detections.xyxy[idx_row]
-                    is_dup = self._is_duplicate_pothole(xyxy_for_row, now_epoch)
+                    tracker_id = detections.tracker_id[idx_row] if detections.tracker_id is not None else None
+                    
+                    if tracker_id is None:
+                        is_dup = True  # Ignore untracked elements
+                    else:
+                        is_dup = (tracker_id in self.seen_pothole_ids)
+
                     if not is_dup:
+                        if tracker_id is not None:
+                            self.seen_pothole_ids.add(tracker_id)
+                        
                         self.total_potholes += 1
                         self.log_seq += 1
                         row["id"] = self.log_seq
