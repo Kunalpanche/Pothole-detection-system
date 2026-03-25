@@ -24,6 +24,8 @@ from ultralytics import YOLO
 from ultralytics.nn.modules.block import AAttn
 from werkzeug.utils import secure_filename
 
+import usb_camera
+
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "pothole_detection_secret_key_2024")
 
@@ -136,6 +138,7 @@ class DetectionEngine:
     def __init__(self) -> None:
         self.model = YOLO(MODEL_PATH)
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        print(f"[{self.__class__.__name__}] Initialized on device: {self.device}")
         self.use_half = self.device.startswith("cuda")
         self.infer_imgsz = max(320, INFER_IMGSZ)
         self.max_capture_width = max(480, MAX_CAPTURE_WIDTH)
@@ -163,6 +166,7 @@ class DetectionEngine:
         self.source_path = DEFAULT_VIDEO
         self.source_label = Path(DEFAULT_VIDEO).name
         self.stream_source_url = ""
+        self.usb_camera_index = int(os.getenv("USB_CAMERA_INDEX", "1"))
         self.phone_last_frame_ts = 0.0
         self.upload_paused = False
         self.upload_speed = 1.0
@@ -368,7 +372,7 @@ class DetectionEngine:
         with torch.no_grad():
             result = self.model.predict(
                 source=proc_frame,
-                conf=0.35,
+                conf=0.50,
                 iou=0.45,
                 imgsz=self.infer_imgsz,
                 device=self.device,
@@ -455,8 +459,14 @@ class DetectionEngine:
                         self.log_seq += 1
                         row["id"] = self.log_seq
                         row["total_count"] = self.total_potholes
+                        
+                        shot_frame = annotated.copy()
+                        x1, y1, x2, y2 = map(int, xyxy_for_row)
+                        cv2.rectangle(shot_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                        cv2.putText(shot_frame, "TRIGGER", (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
                         try:
-                            shot_name = self._save_screenshot(annotated, self.total_potholes)
+                            shot_name = self._save_screenshot(shot_frame, self.total_potholes)
                         except Exception:
                             shot_name = ""
                         row["screenshot"] = f"/screenshots/{shot_name}" if shot_name else ""
@@ -490,6 +500,13 @@ class DetectionEngine:
         return annotated
 
     def _open_capture(self, mode: str, source: str) -> Optional[cv2.VideoCapture]:
+        if mode == "usb":
+            try:
+                cam_idx = int(source)
+                return usb_camera.open_usb_capture(cam_idx)
+            except ValueError:
+                return None
+
         backends: List[int] = []
         if mode == "stream":
             backends.extend([cv2.CAP_FFMPEG, cv2.CAP_ANY])
@@ -524,10 +541,11 @@ class DetectionEngine:
             mode = self.mode
             source = self.source_path
             stream_url = self.stream_source_url
+            usb_index = self.usb_camera_index
 
         cap: Optional[cv2.VideoCapture] = None
-        if mode in {"upload", "stream"}:
-            target_source = stream_url if mode == "stream" else source
+        if mode in {"upload", "stream", "usb"}:
+            target_source = stream_url if mode == "stream" else (str(usb_index) if mode == "usb" else source)
             if mode == "stream" and not target_source:
                 return False, "No RTSP/IP stream URL configured."
 
@@ -538,6 +556,8 @@ class DetectionEngine:
             if cap is None:
                 if mode == "stream":
                     return False, "Could not open stream URL. Check URL, credentials, and network connectivity."
+                elif mode == "usb":
+                    return False, "Could not open USB camera. Ensure the device is connected and DroidCam/IVCam is running."
                 return False, "Could not open uploaded video file. Verify file integrity and supported format."
 
         with self.lock:
@@ -547,6 +567,7 @@ class DetectionEngine:
             self.status_message = (
                 "Phone stream active. Open /video on your phone and tap Start Camera."
                 if mode == "phone"
+                else "Low-latency USB webcam active" if mode == "usb"
                 else "Low-latency streaming and inference active"
             )
             self.last_error = ""
@@ -569,7 +590,7 @@ class DetectionEngine:
             self.stats["detections_per_min"] = 0.0
             self._reset_frame_queue()
 
-        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True) if mode in {"upload", "stream"} else None
+        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True) if mode in {"upload", "stream", "usb"} else None
         self.infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
         if self.capture_thread is not None:
             self.capture_thread.start()
@@ -631,7 +652,7 @@ class DetectionEngine:
                 prev_frame_time = time.perf_counter()
                 continue
 
-            if mode == "stream":
+            if mode in {"stream", "usb"}:
                 # Drain stale frames quickly for live sources so inference always sees the newest frame.
                 for _ in range(2):
                     cap.grab()
@@ -648,23 +669,24 @@ class DetectionEngine:
                         self.status_message = "Upload playback completed"
                     break
 
-                if mode == "stream":
+                if mode in {"stream", "usb"}:
                     consecutive_failures += 1
                     with self.lock:
                         self.status = "warning"
-                        self.status_message = "Stream interrupted. Reconnecting..."
-                        self.last_error = "Stream frame read failed"
+                        self.status_message = f"{mode.capitalize()} interrupted. Reconnecting..."
+                        self.last_error = f"{mode.capitalize()} frame read failed"
 
                     if consecutive_failures >= 10 and (now - last_reconnect_ts) > 1.2:
                         last_reconnect_ts = now
-                        replacement = self._open_capture("stream", stream_url)
+                        repl_source = stream_url if mode == "stream" else str(self.usb_camera_index)
+                        replacement = self._open_capture(mode, repl_source)
                         if replacement is not None:
                             with self.lock:
                                 if self.capture is not None:
                                     self.capture.release()
                                 self.capture = replacement
                                 self.status = "running"
-                                self.status_message = "Stream reconnected"
+                                self.status_message = f"{mode.capitalize()} reconnected"
                                 self.last_error = ""
                             consecutive_failures = 0
                             continue
@@ -776,6 +798,7 @@ class DetectionEngine:
                 "last_error": self.last_error,
                 "source_label": self.source_label,
                 "phone_endpoint": "/video",
+                "usb_camera_index": self.usb_camera_index,
                 "device": "GPU (CUDA)" if self.device.startswith("cuda") else "CPU",
                 "calibrated": bool(self.reference_cm and self.reference_px),
                 "upload_paused": self.upload_paused,
@@ -801,6 +824,22 @@ class DetectionEngine:
                 rows = rows[-limit:]
             last_id = int(self.detection_log[-1]["id"]) if self.detection_log else 0
             return {"rows": rows, "last_id": last_id, "total_rows": len(self.detection_log)}
+
+    def delete_log_entry(self, log_id: int) -> bool:
+        with self.lock:
+            for idx, row in enumerate(self.detection_log):
+                if int(row.get("id", -1)) == log_id:
+                    screenshot = str(row.get("screenshot", ""))
+                    if screenshot:
+                        filename = screenshot.split("/")[-1]
+                        path = SCREENSHOT_DIR / filename
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    self.detection_log.pop(idx)
+                    return True
+            return False
 
     def build_report_data(self) -> Dict[str, object]:
         with self.lock:
@@ -833,7 +872,7 @@ class DetectionEngine:
             }
 
     def set_mode(self, mode: str) -> None:
-        if mode not in {"upload", "phone", "stream"}:
+        if mode not in {"upload", "phone", "stream", "usb"}:
             raise ValueError("Invalid mode")
 
         with self.lock:
@@ -844,6 +883,9 @@ class DetectionEngine:
             elif mode == "phone":
                 self.source_label = "Phone Browser Stream (/video)"
                 self.status_message = "Phone mode selected. Open /video on your phone."
+            elif mode == "usb":
+                self.source_label = f"USB Camera (Index {self.usb_camera_index})"
+                self.status_message = "USB Camera mode selected. Connect phone via DroidCam/IVCam."
             else:
                 self.source_label = self.stream_source_url or "RTSP/IP Stream"
                 self.status_message = "RTSP/IP stream mode selected"
@@ -855,6 +897,14 @@ class DetectionEngine:
             self.mode = "stream"
             self.source_label = stream_url
             self.status_message = "Selected RTSP/IP stream source"
+            self.last_error = ""
+
+    def set_usb_camera(self, camera_index: int) -> None:
+        with self.lock:
+            self.usb_camera_index = camera_index
+            self.mode = "usb"
+            self.source_label = f"USB Camera (Index {camera_index})"
+            self.status_message = f"Selected USB Camera index {camera_index}"
             self.last_error = ""
 
     def set_upload(self, file_path: str, display_name: str) -> None:
@@ -993,7 +1043,7 @@ def select_mode():
     payload = request.get_json(silent=True) or {}
     mode = str(payload.get("mode", "upload"))
 
-    if mode not in {"upload", "phone", "stream"}:
+    if mode not in {"upload", "phone", "stream", "usb"}:
         return jsonify({"ok": False, "error": "Invalid mode."}), 400
 
     engine.stop()
@@ -1017,6 +1067,35 @@ def set_stream_source():
     engine.stop()
     engine.set_stream_source(stream_url)
     return jsonify({"ok": True, "stream_url": stream_url})
+
+
+@app.route("/usb_status", methods=["GET"])
+@login_required
+def get_usb_status():
+    status = usb_camera.get_usb_status()
+    # Add ok flag to response
+    return jsonify({"ok": True, **status})
+
+
+@app.route("/set_usb_camera", methods=["POST"])
+@login_required
+def set_usb_camera():
+    payload = request.get_json(silent=True) or {}
+    camera_index = payload.get("camera_index")
+
+    if camera_index is None:
+        return jsonify({"ok": False, "error": "Camera index is required."}), 400
+
+    try:
+        idx = int(camera_index)
+        if idx < 0:
+            raise ValueError()
+    except ValueError:
+        return jsonify({"ok": False, "error": "Invalid camera index."}), 400
+
+    engine.stop()
+    engine.set_usb_camera(idx)
+    return jsonify({"ok": True, "camera_index": idx})
 
 
 @app.route("/set_calibration", methods=["POST"])
@@ -1078,6 +1157,15 @@ def detection_log():
 
     payload = engine.get_log_slice(since_id=since_id, limit=300)
     return jsonify({"ok": True, **payload})
+
+
+@app.route("/delete_log/<int:log_id>", methods=["DELETE"])
+@login_required
+def delete_log(log_id):
+    success = engine.delete_log_entry(log_id)
+    if success:
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "Log entry not found"}), 404
 
 
 def _draw_report_pdf(report: Dict[str, object]) -> bytes:

@@ -4,6 +4,7 @@ venv/
 env/
 ENV/
 screenshots/
+uploads/
 # Python Cache
 __pycache__/
 *.pyc

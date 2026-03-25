@@ -783,6 +783,7 @@
                                         <th>Depth (cm)</th>
                                         <th>Depth Class</th>
                                         <th>Screenshot</th>
+                                        <th>Actions</th>
                                     </tr>
                                 </thead>
                                 <tbody id="log-body"></tbody>
@@ -800,6 +801,7 @@
                         <button class="tab active" id="tab-upload">Upload</button>
                         <button class="tab" id="tab-phone">Phone</button>
                         <button class="tab" id="tab-stream">RTSP/IP</button>
+                        <button class="tab" id="tab-usb">USB webcam</button>
                     </div>
                 </div>
 
@@ -815,6 +817,20 @@
                     <div id="stream-controls" style="display:grid; gap:8px; margin-top:8px;">
                         <input type="text" id="stream-url" placeholder="rtsp://192.168.1.10:554/stream" />
                         <button class="btn" id="set-stream-btn">Set Stream URL</button>
+                    </div>
+                    <div id="usb-controls" style="display:grid; gap:8px; margin-top:8px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <label for="usb-camera-index" style="font-size:0.85rem; color:var(--text-secondary);">Camera Device:</label>
+                            <button class="btn" id="refresh-usb-btn" style="padding:4px 8px; font-size:0.75rem;">🔄 Refresh</button>
+                        </div>
+                        <select id="usb-camera-index" style="width:100%; border:1px solid var(--border-subtle); border-radius:8px; background:rgba(255,255,255,0.03); color:var(--text); padding:9px 12px; font-size:0.82rem; font-family:inherit;">
+                            <option value="1">Camera 1 (Default USB)</option>
+                            <option value="0">Camera 0 (Built-in)</option>
+                            <option value="2">Camera 2</option>
+                            <option value="3">Camera 3</option>
+                        </select>
+                        <button class="btn" id="set-usb-btn">Set USB Camera</button>
+                        <p id="usb-status-text" style="font-size:0.75rem; color:var(--text-secondary); margin-top:4px;"></p>
                     </div>
                 </div>
 
@@ -971,19 +987,24 @@
             const isUpload = activeMode === "upload";
             const isPhone = activeMode === "phone";
             const isStream = activeMode === "stream";
+            const isUsb = activeMode === "usb";
 
             document.getElementById("tab-upload").classList.toggle("active", isUpload);
             document.getElementById("tab-phone").classList.toggle("active", isPhone);
             document.getElementById("tab-stream").classList.toggle("active", isStream);
+            document.getElementById("tab-usb").classList.toggle("active", isUsb);
 
-            document.getElementById("video-file").disabled = !isUpload;
-            document.getElementById("upload-btn").disabled = !isUpload;
-            document.getElementById("stream-url").disabled = !isStream;
-            document.getElementById("set-stream-btn").disabled = !isStream;
+            document.getElementById("upload-controls").style.display = isUpload ? "grid" : "none";
+            document.getElementById("phone-controls").style.display = isPhone ? "grid" : "none";
+            document.getElementById("stream-controls").style.display = isStream ? "grid" : "none";
+            document.getElementById("usb-controls").style.display = isUsb ? "grid" : "none";
 
-            document.getElementById("active-mode-badge").textContent = isUpload
-                ? "Mode: Video Upload"
-                : (isPhone ? "Mode: Phone Browser" : "Mode: RTSP/IP Stream");
+            let headerText = "Mode: Video Upload";
+            if (isPhone) headerText = "Mode: Phone Browser";
+            else if (isStream) headerText = "Mode: RTSP/IP Stream";
+            else if (isUsb) headerText = "Mode: USB Webcam";
+
+            document.getElementById("active-mode-badge").textContent = headerText;
         }
 
         async function switchMode(mode) {
@@ -1060,6 +1081,52 @@
             alert("RTSP/IP stream source configured.");
         }
 
+        async function setUsbCamera() {
+            const index = document.getElementById("usb-camera-index").value;
+            const data = await postJSON("/set_usb_camera", { camera_index: parseInt(index, 10) });
+            
+            if (!data.ok) {
+                alert(data.error || "Failed to set USB camera.");
+                return;
+            }
+
+            activeMode = "usb";
+            updateModeUI();
+            alert(`USB Camera set to index ${index}. Press Start Detection to view feed.`);
+        }
+
+        async function fetchUsbStatus() {
+            try {
+                const response = await fetch("/usb_status");
+                const data = await response.json();
+                if (data.ok) {
+                    const select = document.getElementById("usb-camera-index");
+                    select.innerHTML = "";
+                    if (data.cameras && data.cameras.length > 0) {
+                        data.cameras.forEach(cam => {
+                            const option = document.createElement("option");
+                            option.value = cam.index;
+                            option.textContent = cam.label;
+                            if (cam.index === data.suggested_index) {
+                                option.selected = true;
+                                option.textContent += " (Recommended)";
+                            }
+                            select.appendChild(option);
+                        });
+                        document.getElementById("usb-status-text").textContent = `Found ${data.camera_count} cameras.`;
+                    } else {
+                        const option = document.createElement("option");
+                        option.value = "1";
+                        option.textContent = "Camera 1 (Default)";
+                        select.appendChild(option);
+                        document.getElementById("usb-status-text").textContent = "No working cameras auto-detected. Try manually selecting index.";
+                    }
+                }
+            } catch (e) {
+                console.error("Failed to fetch USB status", e);
+            }
+        }
+
         async function stopDetection() {
             await postJSON("/stop_detection");
             if (feedRetryTimer) {
@@ -1090,6 +1157,7 @@
             rows.forEach((row) => {
                 const tr = document.createElement("tr");
                 tr.classList.add("new-row");
+                tr.id = `log-row-${row.id}`;
                 tr.innerHTML = `
                     <td>${row.video_time || ""}</td>
                     <td>${row.pothole_detected || "No"}</td>
@@ -1103,6 +1171,7 @@
                             ? `<a class="shot-link" href="${row.screenshot}" data-shot="${row.screenshot}"><img src="${row.screenshot}" alt="shot" /></a>`
                             : "—"}
                     </td>
+                    <td><button class="btn" style="padding: 3px 8px; font-size: 0.75rem; background: rgba(239,68,68,0.15); color: #ef4444; border: 1px solid rgba(239,68,68,0.3);" onclick="deleteLog(${row.id})">Delete</button></td>
                 `;
                 frag.appendChild(tr);
             });
@@ -1133,6 +1202,22 @@
                 lastLogId = Number(data.last_id || lastLogId);
             } catch (_e) {
                 // Ignore transient log polling errors.
+            }
+        }
+
+        async function deleteLog(logId) {
+            if (!confirm("Delete this log entry?")) return;
+            try {
+                const response = await fetch(`/delete_log/${logId}`, { method: "DELETE" });
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok || !data.ok) {
+                    alert(data.error || "Failed to delete log entry.");
+                    return;
+                }
+                const row = document.getElementById(`log-row-${logId}`);
+                if (row) row.remove();
+            } catch (e) {
+                alert("Server unreachable.");
             }
         }
 
@@ -1226,8 +1311,11 @@
         document.getElementById("tab-upload").addEventListener("click", () => switchMode("upload"));
         document.getElementById("tab-phone").addEventListener("click", () => switchMode("phone"));
         document.getElementById("tab-stream").addEventListener("click", () => switchMode("stream"));
+        document.getElementById("tab-usb").addEventListener("click", () => { switchMode("usb"); fetchUsbStatus(); });
         document.getElementById("upload-btn").addEventListener("click", uploadVideo);
         document.getElementById("set-stream-btn").addEventListener("click", setStreamSource);
+        document.getElementById("set-usb-btn").addEventListener("click", setUsbCamera);
+        document.getElementById("refresh-usb-btn").addEventListener("click", fetchUsbStatus);
         document.getElementById("start-btn").addEventListener("click", async () => {
             resetLogTable();
             await startDetection();
